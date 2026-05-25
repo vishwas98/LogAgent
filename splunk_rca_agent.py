@@ -11,6 +11,12 @@ Compression pipeline (6 stages):
   [5] Cluster merger    second-pass similarity merge of near-identical templates
   [6] Token budget      variable-slot differential encoding + hard char cap
 
+Codebase-aware RCA (via codebase_context.py):
+  - Reads GitHub main branch once at startup
+  - Architecture summary → cached LLM system block (shared across all clusters)
+  - Per-cluster: keyword extraction → relevant code snippet injection into prompt
+  - Falls back gracefully when GITHUB_TOKEN / GITHUB_REPO are not set
+
 Dependencies:  pip install requests anthropic urllib3
 Python:        3.10+
 
@@ -20,8 +26,10 @@ Required env vars:
 Optional env vars (defaults shown):
   SPLUNK_INDEX=main  LOOKBACK_MINS=60  MAX_LOG_RESULTS=5000  MAX_LLM_CLUSTERS=20
   DRAIN_SIM=0.5  DRAIN_DEPTH=4  DRAIN_MAX_CHILD=100  MERGE_SIM=0.8
-  LLM_BUDGET_CHARS=2000  MAX_SLOT_VALS=5
+  LLM_BUDGET_CHARS=3500  MAX_SLOT_VALS=5
   SMTP_HOST=smtp.gmail.com  SMTP_PORT=587  EMAIL_FROM=<SMTP_USER>
+  GITHUB_TOKEN=ghp_...  GITHUB_REPO=owner/repo  GITHUB_BRANCH=main
+  MAX_ARCH_CHARS=6000  MAX_SNIPPET_CHARS=2000
 """
 
 from __future__ import annotations
@@ -36,6 +44,8 @@ from typing import Optional
 import urllib3
 import requests
 import anthropic
+
+from codebase_context import CodebaseIndexer
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -67,7 +77,7 @@ MAX_CHILDREN     = int(os.environ.get("DRAIN_MAX_CHILD",   "100"))
 MERGE_SIM        = float(os.environ.get("MERGE_SIM",       "0.8"))   # [4] second-pass merger
 
 # Token budget params
-LLM_BUDGET_CHARS = int(os.environ.get("LLM_BUDGET_CHARS", "2000"))   # [6] ~500 tokens
+LLM_BUDGET_CHARS = int(os.environ.get("LLM_BUDGET_CHARS", "3500"))   # [6] total user prompt cap
 MAX_SLOT_VALS    = int(os.environ.get("MAX_SLOT_VALS",     "5"))      # [5] values per slot
 
 ANOMALY_RE       = re.compile(r"\b(ERROR|EXCEPTION|FAILED|CRITICAL|FATAL)\b", re.I)
@@ -347,66 +357,117 @@ class SplunkClient:
         return [row["_raw"] for row in r2.json().get("results", []) if row.get("_raw")]
 
 # ── LLM RCA ANALYZER ─────────────────────────────────────────────────────────
-_SYS = (
+_SYS_PERSONA = (
     "You are a senior SRE with deep expertise in distributed systems, "
-    "cloud infrastructure, and application debugging. Be concise and precise."
+    "cloud infrastructure, and application debugging. "
+    "When source code is provided, use it to pinpoint exact lines, "
+    "methods, or configs responsible for the error. Be concise and precise."
 )
 
-# [5] Differential encoding template — variable slots replace raw samples
+# [5] Differential encoding — variable slots replace raw samples
+# {code_section} is empty string when no indexer is configured
 _USER_TMPL = """\
 Analyze the log error cluster. Return ONLY valid JSON — no markdown, no fences.
 
 Template : {template}
 Frequency: {count} occurrences
-{context}
+{context}{code_section}
 
 Required JSON (exact keys):
 {{
   "summary":           "<one sentence: what happened and its impact>",
   "technical_context": "<technical explanation of why this error occurs>",
-  "root_cause":        "<the underlying trigger or failure point>",
+  "root_cause":        "<the underlying trigger or failure point — cite file:line if code provided>",
   "action_items":      ["<actionable step 1>", "<step 2>", ...]
 }}"""
 
+
 def _var_summary(cluster: LogCluster) -> str:
-    """Compact slot table: position index, token type, sampled values."""
+    """Compact slot table: token position → sampled dynamic values."""
     if not cluster.var_slots:
         return ""
-    rows = []
-    for pos in sorted(cluster.var_slots):
-        tok  = cluster.template[pos] if pos < len(cluster.template) else "<*>"
-        vals = ", ".join(repr(v) for v in cluster.var_slots[pos])
-        rows.append(f"  [{pos}] {tok}: {vals}")
+    rows = [
+        f"  [{pos}] {cluster.template[pos] if pos < len(cluster.template) else '<*>'}: "
+        + ", ".join(repr(v) for v in cluster.var_slots[pos])
+        for pos in sorted(cluster.var_slots)
+    ]
     return "Variable slots (position → observed values):\n" + "\n".join(rows)
 
+
 def _build_context(cluster: LogCluster) -> str:
-    """Use slot table when available, fall back to raw samples."""
+    """Use compact slot table when available; fall back to raw samples."""
     if cluster.var_slots:
         return _var_summary(cluster)
     samples = "\n".join(f"  {s}" for s in cluster.raw_samples[:3])
     return f"Sample logs:\n{samples}"
 
+
 class RCAAnalyzer:
-    def __init__(self) -> None:
-        self._client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    """
+    LLM-powered root cause analyzer.
+
+    Context hierarchy (token-efficient, cached where possible):
+      System block 1 — SRE persona                    (ephemeral cache)
+      System block 2 — Codebase architecture summary  (ephemeral cache, if indexer set)
+      User message   — Template + var slots + per-cluster code snippets
+    """
+
+    def __init__(self, indexer: Optional[CodebaseIndexer] = None) -> None:
+        self._client  = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        self._indexer = indexer
+        self._arch_block: Optional[dict] = None
+
+        if indexer:
+            log.info("Building codebase architecture summary from GitHub…")
+            arch = indexer.build_arch_summary()
+            if arch:
+                self._arch_block = {
+                    "type":          "text",
+                    "text":          f"## Application Codebase Context\n\n{arch}",
+                    "cache_control": {"type": "ephemeral"},   # cached across all clusters
+                }
+                log.info("Architecture summary ready (%d chars, will be cached by LLM)", len(arch))
+
+    def _system_blocks(self) -> list[dict]:
+        """
+        Two cached system blocks:
+          [0] persona — tiny, always present
+          [1] arch    — large, reused across all N cluster calls (ephemeral cache TTL=5min)
+        """
+        blocks: list[dict] = [{
+            "type":          "text",
+            "text":          _SYS_PERSONA,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        if self._arch_block:
+            blocks.append(self._arch_block)
+        return blocks
 
     def analyze(self, cluster: LogCluster) -> dict:
-        context = _build_context(cluster)
-        prompt  = _USER_TMPL.format(
+        # Per-cluster: find source code relevant to this error template
+        code_section = ""
+        if self._indexer:
+            kws = self._indexer.extract_keywords(cluster.template_str, cluster.var_slots)
+            if kws:
+                snippets = self._indexer.find_snippets(kws)
+                if snippets:
+                    code_section = f"\n\nRelevant source code:\n{snippets}"
+
+        prompt = _USER_TMPL.format(
             template=cluster.template_str[:300],
             count=cluster.count,
-            context=context,
+            context=_build_context(cluster),
+            code_section=code_section,
         )
-        # [6] Token budget: hard cap before sending
+
+        # [6] Hard token budget on the user message
         if len(prompt) > LLM_BUDGET_CHARS:
             prompt = prompt[:LLM_BUDGET_CHARS] + "\n…[truncated]"
 
         resp = self._client.messages.create(
             model=LLM_MODEL,
-            max_tokens=700,
-            # System block cached across all cluster calls — ephemeral TTL 5 min
-            system=[{"type": "text", "text": _SYS,
-                     "cache_control": {"type": "ephemeral"}}],
+            max_tokens=800,
+            system=self._system_blocks(),
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text if resp.content else ""
@@ -534,15 +595,25 @@ class EmailReporter:
 # ── ORCHESTRATOR ─────────────────────────────────────────────────────────────
 class LogMonitorAgent:
     """
-    Full compression pipeline:
-      Splunk → [1]dedup → [2]stackcomp → [3]tokenize+Drain → [4]merge → [5][6]LLM → email
+    Full pipeline:
+      Splunk → [1]dedup → [2]stackcomp → [3]tokenize+Drain → [4]merge
+             → [5][6]LLM(persona+arch+snippets) → email
     """
 
     def __init__(self) -> None:
         self.splunk   = SplunkClient()
         self.drain    = DrainClusterer()
-        self.rca      = RCAAnalyzer()
         self.reporter = EmailReporter()
+
+        # Codebase indexer: optional but strongly recommended for accurate RCA.
+        # Set GITHUB_TOKEN + GITHUB_REPO=owner/repo to enable.
+        indexer = CodebaseIndexer.from_env()
+        if not indexer:
+            log.info(
+                "No GITHUB_TOKEN/GITHUB_REPO set — RCA will use generic SRE context only. "
+                "Set both env vars to enable codebase-aware root cause analysis."
+            )
+        self.rca = RCAAnalyzer(indexer)
 
     def run(self) -> None:
         stats = CompressionStats()
@@ -591,10 +662,11 @@ class LogMonitorAgent:
 
         # ── [5][6] LLM RCA (differential encoding + budget cap)
         analyses: dict[str, dict] = {}
+        code_ctx = "on" if self.rca._indexer else "off"
         for i, c in enumerate(top, 1):
-            log.info("[%d/%d] RCA %s sev=%s ×%d slots=%d",
+            log.info("[%d/%d] RCA %s sev=%s ×%d slots=%d code-ctx=%s",
                      i, len(top), c.cluster_id, c.severity,
-                     c.count, len(c.var_slots))
+                     c.count, len(c.var_slots), code_ctx)
             analyses[c.cluster_id] = self.rca.analyze(c)
 
         self.reporter.send(top, analyses, stats)
