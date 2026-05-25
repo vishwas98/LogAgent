@@ -3,6 +3,9 @@
 splunk_rca_agent.py
 Splunk anomaly monitor → enhanced Drain clustering → LLM RCA → HTML email
 
+Runs as a 24/7 daemon (LogMonitorAgent.start()) or single-shot (run_once()).
+Only fires the LLM + email when NEW error patterns appear — quiet cycles are silent.
+
 Compression pipeline (6 stages):
   [1] Pre-dedup         exact-hash lines → count weights (O(1)/line)
   [2] Stack compressor  collapse Java/Python frames → 2 kept + N omitted
@@ -30,6 +33,7 @@ Optional env vars (defaults shown):
   SMTP_HOST=smtp.gmail.com  SMTP_PORT=587  EMAIL_FROM=<SMTP_USER>
   GITHUB_TOKEN=ghp_...  GITHUB_REPO=owner/repo  GITHUB_BRANCH=main
   MAX_ARCH_CHARS=6000  MAX_SNIPPET_CHARS=2000
+  POLL_INTERVAL_SECS=3600  DEDUP_WINDOW_MINS=120
 """
 
 from __future__ import annotations
@@ -39,7 +43,10 @@ import json
 import logging
 import os
 import re
+import signal
 import smtplib
+import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,6 +101,13 @@ MAX_SLOT_VALS = int(os.environ.get("MAX_SLOT_VALS", "5"))  # [5] values per slot
 PRE_WINDOW_SECS = int(os.environ.get("PRE_WINDOW_SECS", "180"))  # 3 min before first error
 POST_WINDOW_SECS = int(os.environ.get("POST_WINDOW_SECS", "120"))  # 2 min after first error
 MAX_CONTEXT_SOURCES = int(os.environ.get("MAX_CONTEXT_SOURCES", "30"))  # OR-clause cap
+
+# Continuous-daemon params
+# POLL_INTERVAL_SECS: how often to query Splunk (should match or be a multiple of LOOKBACK_MINS)
+# DEDUP_WINDOW_MINS: suppress re-alerting on the same cluster pattern within this many minutes
+#   (prevents hourly repeat emails for a persistent error that hasn't been fixed yet)
+POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "3600"))  # poll every 1 hour
+DEDUP_WINDOW_MINS = int(os.environ.get("DEDUP_WINDOW_MINS", "120"))  # suppress repeats for 2h
 
 ANOMALY_RE = re.compile(r"\b(ERROR|EXCEPTION|FAILED|CRITICAL|FATAL)\b", re.I)
 
@@ -787,18 +801,22 @@ class EmailReporter:
 # ── ORCHESTRATOR ─────────────────────────────────────────────────────────────
 class LogMonitorAgent:
     """
-    Full pipeline:
-      Splunk → [1]dedup → [2]stackcomp → [3]tokenize+Drain → [4]merge
-             → [5][6]LLM(persona+arch+snippets) → email
+    Full 24/7 monitoring agent.
+
+    Pipeline per cycle:
+      Splunk (2-pass) → [1]dedup → [2]stackcomp → [3]tokenize+Drain → [4]merge
+      → cluster dedup (suppress known patterns) → [5][6]LLM → email
+
+    LLM and email are only triggered when NEW error patterns appear.
+    Quiet cycles (no errors, or all patterns already reported recently) are silent.
     """
 
     def __init__(self) -> None:
         self.splunk = SplunkClient()
-        self.drain = DrainClusterer()
         self.reporter = EmailReporter()
 
         # Codebase indexer: optional but strongly recommended for accurate RCA.
-        # Set GITHUB_TOKEN + GITHUB_REPO=owner/repo to enable.
+        # Loaded once at startup; architecture summary cached across all cluster calls.
         indexer = CodebaseIndexer.from_env()
         if not indexer:
             log.info(
@@ -807,12 +825,45 @@ class LogMonitorAgent:
             )
         self.rca = RCAAnalyzer(indexer)
 
-    def run(self) -> None:
+        # Cross-cycle dedup: cluster_id → epoch time when last reported.
+        # Prevents re-alerting on the same persistent error every poll cycle.
+        self._reported: dict[str, float] = {}
+
+    # ── Dedup helpers ─────────────────────────────────────────────────────────
+
+    def _prune_dedup(self) -> None:
+        """Drop cluster IDs that have aged past the dedup window."""
+        cutoff = time.time() - DEDUP_WINDOW_MINS * 60
+        self._reported = {cid: t for cid, t in self._reported.items() if t > cutoff}
+
+    def _split_new_known(
+        self, clusters: list[LogCluster]
+    ) -> tuple[list[LogCluster], list[LogCluster]]:
+        """Return (new_clusters, suppressed_clusters) based on dedup window."""
+        self._prune_dedup()
+        new: list[LogCluster] = []
+        known: list[LogCluster] = []
+        for c in clusters:
+            (known if c.cluster_id in self._reported else new).append(c)
+        return new, known
+
+    # ── Single poll cycle ─────────────────────────────────────────────────────
+
+    def run_once(self) -> bool:
+        """
+        Execute one complete poll cycle.
+
+        Returns True  if an alert email was sent (new error patterns found).
+        Returns False if the cycle was quiet (no errors, or all patterns already known).
+
+        The LLM is never called on a quiet cycle — zero API cost when nothing is wrong.
+        """
+        drain = DrainClusterer()  # fresh clusterer per cycle — each window is independent
         stats = CompressionStats()
 
-        # ── Pass 1 + 2: error discovery → time-windowed context batch fetch
+        # ── Pass 1 + 2: error discovery → time-windowed context batch fetch ──
         log.info(
-            "Fetching — last %d min | index=%s | window: -%ds/+%ds around first error",
+            "Polling — last %d min | index=%s | window: -%ds/+%ds around first error",
             LOOKBACK_MINS,
             SPLUNK_INDEX,
             PRE_WINDOW_SECS,
@@ -820,18 +871,18 @@ class LogMonitorAgent:
         )
         ctx_events: list[ContextualEvent] = self.splunk.fetch_anomalies()
         if not ctx_events:
-            log.info("No anomaly events. Exiting.")
-            return
+            log.info("✅  All quiet — no ERROR/EXCEPTION/FAILED/CRITICAL/FATAL in last %d min.", LOOKBACK_MINS)
+            return False
 
         stats.raw = len(ctx_events)
         stats.context_lines = sum(len(ctx) for _, ctx in ctx_events)
         log.info(
-            "Fetched %d error events across %d context lines total",
+            "⚠️  %d error event(s) across %d context lines — running compression pipeline",
             stats.raw,
             stats.context_lines,
         )
 
-        # ── [1] Pre-dedup on error_line; keep first context window seen per unique line
+        # ── [1] Pre-dedup on error_line; keep first context window per unique line ──
         seen: dict[str, list[str]] = {}  # error_line → context_window
         for error_line, ctx in ctx_events:
             if error_line not in seen:
@@ -844,9 +895,8 @@ class LogMonitorAgent:
             stats.raw / max(stats.unique, 1),
         )
 
-        # ── [2] Stack trace compression on error lines; preserve context window
-        # compressed_line → (context_window, weight)
-        compressed: dict[str, tuple[list[str], int]] = {}
+        # ── [2] Stack trace compression; preserve context window ──────────────
+        compressed: dict[str, tuple[list[str], int]] = {}  # line → (ctx, weight)
         for error_line, ctx in seen.items():
             c = compress_stacktrace(error_line)
             if c in compressed:
@@ -857,15 +907,15 @@ class LogMonitorAgent:
         stats.compressed = len(compressed)
         log.info("[2] stack-compress: %d → %d lines", stats.unique, stats.compressed)
 
-        # ── [3] Drain clustering (error_line, context_window, weight)
+        # ── [3] Drain clustering (error_line, context_window, weight) ─────────
         drain_input: list[tuple[str, list[str], int]] = [
             (line, ctx, weight) for line, (ctx, weight) in compressed.items()
         ]
-        clusters = self.drain.cluster(drain_input)
+        clusters = drain.cluster(drain_input)
         stats.clusters = len(clusters)
         log.info("[3] drain: %d clusters", stats.clusters)
 
-        # ── [4] Post-drain merge
+        # ── [4] Post-drain merge ──────────────────────────────────────────────
         clusters = merge_clusters(clusters)
         stats.merged = len(clusters)
         log.info(
@@ -876,22 +926,39 @@ class LogMonitorAgent:
         )
 
         if not clusters:
-            log.info("Zero clusters after merge. Exiting.")
-            return
+            log.info("Zero clusters after merge — nothing to report.")
+            return False
 
-        # ── Top-N selection
+        # ── Top-N selection ───────────────────────────────────────────────────
         top = sorted(clusters, key=lambda c: -c.count)[:MAX_LLM_CLUSTERS]
-        stats.llm_sent = len(top)
+
+        # ── Cross-cycle dedup: skip patterns seen in the last DEDUP_WINDOW_MINS ──
+        new_clusters, suppressed = self._split_new_known(top)
+        if suppressed:
+            log.info(
+                "🔕  Suppressed %d cluster(s) already reported within the last %d-min dedup window: %s",
+                len(suppressed),
+                DEDUP_WINDOW_MINS,
+                ", ".join(f"#{c.cluster_id}" for c in suppressed),
+            )
+        if not new_clusters:
+            log.info(
+                "✅  All %d cluster(s) are known patterns — no new anomalies to report.",
+                len(top),
+            )
+            return False
+
+        stats.llm_sent = len(new_clusters)
         log.info("Compression: %s", stats.summary())
 
-        # ── [5][6] LLM RCA (differential encoding + budget cap)
+        # ── [5][6] LLM RCA — only for NEW clusters (conditional on error presence) ──
         analyses: dict[str, dict] = {}
         code_ctx = "on" if self.rca._indexer else "off"
-        for i, c in enumerate(top, 1):
+        for i, c in enumerate(new_clusters, 1):
             log.info(
                 "[%d/%d] RCA %s sev=%s ×%d slots=%d code-ctx=%s",
                 i,
-                len(top),
+                len(new_clusters),
                 c.cluster_id,
                 c.severity,
                 c.count,
@@ -900,8 +967,75 @@ class LogMonitorAgent:
             )
             analyses[c.cluster_id] = self.rca.analyze(c)
 
-        self.reporter.send(top, analyses, stats)
-        log.info("Done.")
+        # Mark as reported before sending (so a crash during send still avoids spam)
+        now_ts = time.time()
+        for c in new_clusters:
+            self._reported[c.cluster_id] = now_ts
+
+        self.reporter.send(new_clusters, analyses, stats)
+        log.info("🚨  Alert sent — %d new cluster(s) reported.", len(new_clusters))
+        return True
+
+    # ── 24/7 daemon loop ──────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """
+        Run as a 24/7 daemon.
+
+        - Polls Splunk every POLL_INTERVAL_SECS seconds (default: 3600 = 1 h).
+        - Only calls the LLM and sends email when NEW error patterns appear.
+        - Suppresses repeat alerts for the same cluster within DEDUP_WINDOW_MINS minutes.
+        - Recovers from transient errors (Splunk down, network blip) without crashing.
+        - Graceful shutdown on SIGTERM or Ctrl+C — finishes the current cycle first.
+        """
+        _shutdown = threading.Event()
+
+        def _handle_signal(sig: int, frame: object) -> None:
+            log.info("🛑  Shutdown signal received (sig=%d) — finishing current cycle then stopping.", sig)
+            _shutdown.set()
+
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+
+        log.info(
+            "🚀  LogAgent daemon started | poll every %ds (%dm) | dedup window: %dm | index: %s",
+            POLL_INTERVAL_SECS,
+            POLL_INTERVAL_SECS // 60,
+            DEDUP_WINDOW_MINS,
+            SPLUNK_INDEX,
+        )
+
+        cycle = 0
+        while not _shutdown.is_set():
+            cycle += 1
+            cycle_start = time.time()
+            log.info("── Cycle #%d ────────────────────────────────────────────────", cycle)
+
+            try:
+                self.run_once()
+            except Exception as exc:
+                log.error(
+                    "Cycle #%d encountered an error: %s — sleeping and retrying next cycle.",
+                    cycle,
+                    exc,
+                    exc_info=True,
+                )
+
+            elapsed = time.time() - cycle_start
+            sleep_secs = max(0.0, POLL_INTERVAL_SECS - elapsed)
+
+            if not _shutdown.is_set():
+                log.info(
+                    "── Cycle #%d done in %.1fs — next poll in %dm %02ds ───────────────",
+                    cycle,
+                    elapsed,
+                    int(sleep_secs) // 60,
+                    int(sleep_secs) % 60,
+                )
+                # Block until next cycle or shutdown — wakes immediately on Ctrl+C / SIGTERM
+                _shutdown.wait(timeout=sleep_secs)
+
+        log.info("👋  LogAgent stopped cleanly after %d cycle(s).", cycle)
 
 
 # ── ENTRY POINT ──────────────────────────────────────────────────────────────
@@ -913,4 +1047,4 @@ if __name__ == "__main__":
     ]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
-    LogMonitorAgent().run()
+    LogMonitorAgent().start()

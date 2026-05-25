@@ -211,23 +211,46 @@ Transport: SMTP STARTTLS  (Gmail App Password / any SMTP relay)
 
 ---
 
-### 6. logagent CLI
+### 6. 24/7 Daemon Loop (LogMonitorAgent.start)
+
+```
+LogMonitorAgent.start()
+  │
+  │  Register SIGTERM / SIGINT → threading.Event (_shutdown)
+  │
+  └─ while not _shutdown.is_set():
+       │
+       ├─ run_once()
+       │    ├─ [no errors]         → log "All quiet", return False
+       │    ├─ [all clusters known] → log "No new patterns", return False
+       │    └─ [new clusters]      → LLM RCA → email → mark reported, return True
+       │
+       ├─ sleep = max(0, POLL_INTERVAL_SECS - cycle_elapsed)
+       └─ _shutdown.wait(timeout=sleep)  ← wakes immediately on Ctrl+C / SIGTERM
+
+  Dedup state: dict[cluster_id → epoch_reported] persists across cycles in memory.
+  Clusters age out after DEDUP_WINDOW_MINS (default 120 min).
+  Zero LLM API calls on quiet cycles.
+```
+
+### 7. logagent CLI
 
 ```
 logagent init
   │  Wizard sections (in order, each tested live before proceeding):
   ├── Splunk     → POST /services/auth/login
+  │    also prompts: POLL_INTERVAL_SECS, DEDUP_WINDOW_MINS
   ├── Anthropic  → messages.create (claude-haiku-4-5, 5 tokens)
   ├── SMTP       → STARTTLS login
   └── GitHub     → GET /repos/{owner}/{repo}
   Saves: ~/.logagent/config.env  (chmod 600)
 
-logagent run
-  Load ~/.logagent/config.env → os.environ → LogMonitorAgent().run()
-  Writes: ~/.logagent/last_run.json  {status, timestamp, elapsed_s}
+logagent run          → LogMonitorAgent().start()   (continuous daemon, blocks)
+logagent run --once   → LogMonitorAgent().run_once() (single cycle, for cron)
+  Both write: ~/.logagent/last_run.json  {status, timestamp, elapsed_s}
 
 logagent test   →  re-runs all 4 connection checks
-logagent status →  reads last_run.json
+logagent status →  reads last_run.json (status: running | alerted | quiet | stopped | failed)
 logagent config →  prints config.env (secrets masked to ****last4)
 ```
 

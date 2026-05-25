@@ -76,10 +76,12 @@ The architecture summary (your repo's README, configs, error handlers — ~6,000
 pip install splunk-logagent
 
 logagent init   # interactive wizard — tests every connection live
-logagent run    # send your first report
+logagent run    # start the 24/7 continuous daemon (Ctrl+C to stop)
 ```
 
 That's it. No config files to hand-edit.
+
+LogAgent runs **continuously** — it polls Splunk every hour, only calls the LLM and sends email when **new** error patterns appear. Quiet periods generate zero API calls and zero emails.
 
 ---
 
@@ -118,12 +120,40 @@ Credentials are stored at `~/.logagent/config.env` (chmod 600 — owner-readable
 
 ---
 
+## How the continuous daemon works
+
+```
+logagent run
+     │
+     └─ every POLL_INTERVAL_SECS (default: 1 hour)
+          │
+          ├─ fetch Splunk — any ERROR/EXCEPTION/FAILED/CRITICAL/FATAL?
+          │
+          ├─ [NO]  → "All quiet" log line. Zero API calls. Waits for next cycle.
+          │
+          └─ [YES] → 6-stage compression pipeline
+                      → cluster deduplication (already reported within DEDUP_WINDOW_MINS?)
+                           │
+                           ├─ [all known] → "No new patterns" log. Zero API calls.
+                           │
+                           └─ [new patterns] → LLM RCA → email alert → back to sleep
+```
+
+Key behaviour:
+- **Zero cost when healthy** — LLM is never called if there are no errors.
+- **No alert storms** — same error pattern reported at most once per `DEDUP_WINDOW_MINS` (default: 2 h). You won't get 24 emails about the same DB timeout.
+- **Resilient** — if Splunk is unreachable, the cycle logs the error and retries next interval. The daemon never crashes.
+- **Graceful shutdown** — `Ctrl+C` or `SIGTERM` completes the current cycle, then exits cleanly.
+
+---
+
 ## Other commands
 
 ```bash
-logagent test     # re-test all saved connections
-logagent status   # show last run timestamp + result
-logagent config   # print current config (secrets masked)
+logagent test             # re-test all saved connections
+logagent status           # show last run / daemon state
+logagent config           # print current config (secrets masked)
+logagent run --once       # single poll cycle then exit (for cron scheduling)
 ```
 
 ---
@@ -147,16 +177,44 @@ docker run --rm \
 
 ---
 
-## Schedule it (run every hour)
+## Running as a 24/7 daemon (recommended)
+
+```bash
+logagent run        # blocks — stays alive until Ctrl+C or SIGTERM
+```
+
+**Systemd service (Linux):**
+```ini
+[Unit]
+Description=LogAgent Splunk Monitor
+After=network.target
+
+[Service]
+ExecStart=logagent run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl enable --now logagent
+```
+
+---
+
+## Alternative: cron / one-shot mode
+
+If you prefer scheduled one-shot runs (e.g., cron or Task Scheduler), use `--once`:
 
 **Linux/Mac (cron):**
 ```bash
-echo "0 * * * * $(which logagent) run >> ~/.logagent/agent.log 2>&1" | crontab -
+echo "0 * * * * $(which logagent) run --once >> ~/.logagent/agent.log 2>&1" | crontab -
 ```
 
 **Windows (Task Scheduler):**
 ```powershell
-schtasks /create /tn "LogAgent" /tr "logagent run" /sc hourly /mo 1
+schtasks /create /tn "LogAgent" /tr "logagent run --once" /sc hourly /mo 1
 ```
 
 **Kubernetes CronJob:**
@@ -174,11 +232,14 @@ spec:
           containers:
           - name: logagent
             image: logagent:latest
+            args: ["run", "--once"]
             envFrom:
             - secretRef:
                 name: logagent-secrets
           restartPolicy: OnFailure
 ```
+
+> **Note:** In cron mode, the cross-cycle deduplication (`DEDUP_WINDOW_MINS`) resets on each run because the process is ephemeral. Use the daemon mode to preserve dedup state in memory.
 
 ---
 
@@ -242,6 +303,8 @@ All settings via `~/.logagent/config.env` (created by `logagent init`).
 | `DRAIN_SIM` | `0.5` | Cluster similarity threshold (0–1) |
 | `MERGE_SIM` | `0.8` | Second-pass merge threshold |
 | `LLM_BUDGET_CHARS` | `3500` | Hard cap on user-message chars per LLM call |
+| `POLL_INTERVAL_SECS` | `3600` | Daemon poll interval in seconds (default: 1 hour) |
+| `DEDUP_WINDOW_MINS` | `120` | Suppress repeat alerts for same cluster within N minutes |
 
 ---
 

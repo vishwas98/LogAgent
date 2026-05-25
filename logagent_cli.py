@@ -196,7 +196,13 @@ def cmd_init() -> None:
     cfg["SPLUNK_USER"] = _prompt("Username", existing.get("SPLUNK_USER", "admin"))
     cfg["SPLUNK_PASS"] = _prompt("Password", secret=True)
     cfg["SPLUNK_INDEX"] = _prompt("Index", existing.get("SPLUNK_INDEX", "main"))
-    cfg["LOOKBACK_MINS"] = _prompt("Lookback (min)", existing.get("LOOKBACK_MINS", "60"))
+    cfg["LOOKBACK_MINS"] = _prompt("Lookback window (min)", existing.get("LOOKBACK_MINS", "60"))
+    cfg["POLL_INTERVAL_SECS"] = _prompt(
+        "Poll interval (sec)  [3600=hourly]", existing.get("POLL_INTERVAL_SECS", "3600")
+    )
+    cfg["DEDUP_WINDOW_MINS"] = _prompt(
+        "Dedup window (min)   [120=2h re-alert]", existing.get("DEDUP_WINDOW_MINS", "120")
+    )
 
     print()
     if not _test_splunk(cfg):
@@ -273,8 +279,15 @@ def cmd_test() -> None:
         sys.exit(1)
 
 
-def cmd_run() -> None:
-    """Load config and run the agent once."""
+def cmd_run(once: bool = False) -> None:
+    """
+    Run the agent.
+
+    Default (once=False): 24/7 continuous daemon — polls Splunk every POLL_INTERVAL_SECS,
+    only fires LLM + email when new error patterns appear. Runs until SIGTERM / Ctrl+C.
+
+    once=True: single poll cycle then exit — for cron job scheduling.
+    """
     cfg = _load()
     if not cfg:
         print("Not configured. Run:  logagent init")
@@ -284,15 +297,30 @@ def cmd_run() -> None:
     # Add package directory so sibling modules can be imported
     sys.path.insert(0, str(Path(__file__).parent))
 
-    start = time.time()
+    t0 = time.time()
     try:
         from splunk_rca_agent import LogMonitorAgent
 
-        LogMonitorAgent().run()
-        elapsed = time.time() - start
-        _write_status("success", elapsed)
+        agent = LogMonitorAgent()
+
+        if once:
+            # Single-shot mode: one cycle, write status, exit.
+            sent = agent.run_once()
+            elapsed = time.time() - t0
+            _write_status("alerted" if sent else "quiet", elapsed)
+        else:
+            # Continuous daemon mode: blocks until Ctrl+C / SIGTERM.
+            print(
+                "\n🚀  LogAgent running in continuous mode.\n"
+                "    Press Ctrl+C or send SIGTERM to stop gracefully.\n"
+            )
+            _write_status("running", 0.0)
+            agent.start()  # blocks until shutdown signal
+            elapsed = time.time() - t0
+            _write_status("stopped", elapsed)
+
     except Exception as exc:
-        elapsed = time.time() - start
+        elapsed = time.time() - t0
         _write_status("failed", elapsed, str(exc))
         print(f"\n❌  Agent failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -351,23 +379,39 @@ def main() -> None:
         epilog="""
 commands:
   init      Interactive setup wizard — configure Splunk, Anthropic, email, GitHub
-  run       Run the agent once and send the report
+  run       Start the 24/7 continuous monitoring daemon (Ctrl+C to stop)
   test      Re-test all saved connections without running the agent
-  status    Show last run timestamp and result
+  status    Show last run / daemon state
   config    Print current config (secrets masked)
 
-quick start:
+flags:
+  --once    With 'run': execute a single poll cycle then exit (for cron scheduling)
+
+quick start (2 min):
   pip install splunk-logagent
   logagent init
-  logagent run
+  logagent run           ← continuous daemon, stays running 24/7
+  logagent run --once    ← single check, for cron
+
+cron (if you prefer scheduled single-shot):
+  # Linux/Mac — every hour:
+  0 * * * * logagent run --once >> ~/.logagent/agent.log 2>&1
+
+  # Windows Task Scheduler:
+  schtasks /create /tn "LogAgent" /tr "logagent run --once" /sc hourly /mo 1
         """,
     )
     p.add_argument("command", choices=["init", "run", "test", "status", "config"])
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="With 'run': single poll cycle then exit (for cron). Default: continuous daemon.",
+    )
     args = p.parse_args()
 
     dispatch = {
         "init": cmd_init,
-        "run": cmd_run,
+        "run": lambda: cmd_run(once=args.once),
         "test": cmd_test,
         "status": cmd_status,
         "config": cmd_config,
@@ -375,7 +419,7 @@ quick start:
     try:
         dispatch[args.command]()
     except KeyboardInterrupt:
-        print("\n\nAborted.")
+        print("\n\nStopped.")
         sys.exit(0)
 
 
