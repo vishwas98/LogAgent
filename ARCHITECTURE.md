@@ -155,27 +155,37 @@ GitHub REST API  (one session, all responses in-memory cached)
            └── return ≤5 snippets  (capped at MAX_SNIPPET_CHARS=2000)
 ```
 
-**Deploy detection flow (per daemon cycle):**
+**Daily refresh flow (time-gated, once per day at 7 AM ET):**
 ```
-run_once() called
+run_once() called (every poll cycle)
   │
   └─ rca.refresh_codebase()
        │
-       └─ indexer.refresh_if_stale()
-            │
-            ├─ GET /branches/{branch}  →  sha = "abc123ef..."
-            │
-            ├─ sha == _indexed_sha?
-            │    YES → return False  (1 API call total, no rebuild)
-            │
-            └─ NO  → log "New commit: old → new"
-                      _tree = None  (tree re-fetched on next _get_tree())
-                      _files.clear()  (all content re-fetched on next _read())
-                      _indexed_sha = sha
-                      return True
-                        └─ rca.refresh_codebase() calls build_arch_summary()
-                             → fresh tree + fresh files → new LLM system block
+       ├─ now_et.hour < CODEBASE_REFRESH_HOUR?  →  return False  (no GitHub calls at all)
+       ├─ _last_refresh_date == today_et?        →  return False  (already done today)
+       │
+       └─ [first cycle at or after 7 AM ET]
+            ⏰  Daily refresh triggered
+            indexer.force_reindex()
+              _tree = None          (tree re-fetched on next _get_tree())
+              _files.clear()        (all content re-fetched on next _read())
+              _indexed_sha = None   (re-captured in next build_arch_summary())
+            indexer.build_arch_summary()  →  fresh tree + fresh files
+            _last_refresh_date = today_et
+            self._arch_block = new LLM system block
+            return True
+
+Startup behaviour:
+  Hour >= 7 AM ET  → mark _last_refresh_date = today (startup IS the refresh)
+                     next refresh: 7 AM tomorrow
+  Hour <  7 AM ET  → _last_refresh_date = None
+                     daily refresh fires naturally when clock crosses 7 AM
 ```
+
+GitHub API calls per day:
+  - 23 hours of quiet cycles: **0 GitHub calls**
+  - 1 daily refresh window:   **~5–15 calls** (tree + priority files)
+  Total: ~15 calls/day regardless of how frequently Splunk is polled.
 
 ---
 

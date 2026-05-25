@@ -305,6 +305,7 @@ All settings via `~/.logagent/config.env` (created by `logagent init`).
 | `LLM_BUDGET_CHARS` | `3500` | Hard cap on user-message chars per LLM call |
 | `POLL_INTERVAL_SECS` | `3600` | Daemon poll interval in seconds (default: 1 hour) |
 | `DEDUP_WINDOW_MINS` | `120` | Suppress repeat alerts for same cluster within N minutes |
+| `CODEBASE_REFRESH_HOUR` | `7` | Hour (0-23) in Eastern Time to re-index GitHub codebase daily |
 
 ---
 

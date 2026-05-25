@@ -260,6 +260,21 @@ class CodebaseIndexer:
         self._indexed_sha = current_sha
         return True
 
+    def force_reindex(self) -> None:
+        """
+        Clear all cached data so the next build_arch_summary() call fetches
+        everything fresh from GitHub.
+
+        Called by the daily 7 AM ET refresh in RCAAnalyzer.refresh_codebase().
+        After this call, the next _get_tree() re-fetches the file tree and every
+        _read() re-fetches file content — ensuring overnight commits (new files,
+        changed code) are fully reflected in the next RCA run.
+        """
+        self._tree = None
+        self._files.clear()
+        self._indexed_sha = None  # will be re-captured in next build_arch_summary()
+        log.debug("CodebaseIndexer: all caches cleared — full re-index on next build_arch_summary().")
+
     def build_arch_summary(self) -> str:
         """
         Build (or rebuild) the architecture summary for use as an LLM system block.

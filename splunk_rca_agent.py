@@ -49,9 +49,20 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+# Eastern Time zone — used to schedule the daily 7 AM codebase refresh.
+# zoneinfo (stdlib 3.9+) handles DST automatically; falls back to a fixed UTC-5
+# offset if timezone data is unavailable (Windows without the tzdata package).
+try:
+    from zoneinfo import ZoneInfo
+
+    _EASTERN = ZoneInfo("America/New_York")
+except Exception:
+    # Install the 'tzdata' PyPI package for full DST support on Windows.
+    _EASTERN = timezone(timedelta(hours=-5))  # type: ignore[assignment]
 
 import anthropic
 import requests
@@ -108,6 +119,13 @@ MAX_CONTEXT_SOURCES = int(os.environ.get("MAX_CONTEXT_SOURCES", "30"))  # OR-cla
 #   (prevents hourly repeat emails for a persistent error that hasn't been fixed yet)
 POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECS", "3600"))  # poll every 1 hour
 DEDUP_WINDOW_MINS = int(os.environ.get("DEDUP_WINDOW_MINS", "120"))  # suppress repeats for 2h
+
+# Hour (0-23) in Eastern Time at which the codebase index is refreshed once per day.
+# Default 7 AM ET: picks up any overnight / early-morning deploys before business hours.
+# Deploys during business hours (7 AM – 6 PM ET) are excluded by team convention,
+# so one refresh at the start of the day is sufficient — no need to check GitHub on
+# every poll cycle.
+CODEBASE_REFRESH_HOUR = int(os.environ.get("CODEBASE_REFRESH_HOUR", "7"))
 
 ANOMALY_RE = re.compile(r"\b(ERROR|EXCEPTION|FAILED|CRITICAL|FATAL)\b", re.I)
 
@@ -627,34 +645,76 @@ class RCAAnalyzer:
                     len(arch),
                 )
 
+        # Track the Eastern-time date on which the codebase was last refreshed.
+        # Prevents the daily 7 AM trigger from re-indexing immediately if the daemon
+        # starts after 7 AM (startup already built a fresh index).
+        # None = not yet set; the 7 AM window fires as soon as it passes for the first time.
+        now_et = datetime.now(_EASTERN)
+        if now_et.hour >= CODEBASE_REFRESH_HOUR and indexer:
+            # Daemon started at or after today's scheduled refresh time.
+            # Mark today as done — daily refresh will next fire at 7 AM tomorrow.
+            self._last_refresh_date: date | None = now_et.date()
+            log.info(
+                "Daemon started after %02d:00 ET — daily codebase refresh will next fire tomorrow.",
+                CODEBASE_REFRESH_HOUR,
+            )
+        else:
+            # Daemon started before 7 AM or GitHub not configured.
+            # Daily refresh will fire naturally when the clock crosses 7 AM ET today.
+            self._last_refresh_date = None
+
     def refresh_codebase(self) -> bool:
         """
-        Check whether new commits have landed on the application repo branch since the
-        last index build.  If so, invalidate the file cache and rebuild the LLM
-        architecture context block so every subsequent RCA call uses up-to-date code.
+        Refresh the codebase index once per day at CODEBASE_REFRESH_HOUR Eastern Time.
 
-        Called once at the top of every daemon poll cycle — keeps the codebase context
-        in sync with whatever version is currently deployed without manual restarts.
+        Decision logic (checked at the top of every daemon poll cycle):
+          • Not configured (no GitHub token) → skip, return False.
+          • Already refreshed today (Eastern date) → skip, return False.
+          • Current Eastern hour < CODEBASE_REFRESH_HOUR → not yet time, return False.
+          • Past CODEBASE_REFRESH_HOUR and not yet refreshed today → full re-index.
 
-        Cost: 1 lightweight GitHub API call (branch HEAD SHA) per cycle.
-        If the SHA is unchanged → zero additional cost, returns False immediately.
-        If new commits detected → rebuilds arch summary (~5–15 GitHub API calls), returns True.
+        Why time-gated rather than per-cycle SHA check:
+          Deploys only happen outside business hours (before 7 AM or after 6 PM ET by
+          convention).  A single 7 AM re-index captures overnight / early-morning commits
+          before the first business-hours alert of the day, with zero GitHub API calls
+          during the remaining 23 hours of each cycle.
+
+        Returns True if a refresh was performed, False if skipped.
         """
         if not self._indexer:
             return False
 
-        if not self._indexer.refresh_if_stale():
-            return False  # branch SHA unchanged — existing system block is still valid
+        now_et = datetime.now(_EASTERN)
+        today_et = now_et.date()
 
-        log.info("Rebuilding LLM architecture context block from refreshed codebase…")
-        arch = self._indexer.build_arch_summary()
+        if self._last_refresh_date == today_et:
+            return False  # already refreshed today — skip
+
+        if now_et.hour < CODEBASE_REFRESH_HOUR:
+            return False  # daily window hasn't opened yet
+
+        # ── Scheduled daily refresh ───────────────────────────────────────────
+        log.info(
+            "⏰  Daily %02d:00 ET codebase refresh — re-indexing %s/%s@%s",
+            CODEBASE_REFRESH_HOUR,
+            self._indexer.owner,
+            self._indexer.repo,
+            self._indexer.branch,
+        )
+        self._indexer.force_reindex()  # clear file-tree + content caches
+        arch = self._indexer.build_arch_summary()  # fetch fresh from GitHub
+        self._last_refresh_date = today_et  # mark done for today
+
         if arch:
             self._arch_block = {
                 "type": "text",
                 "text": f"## Application Codebase Context\n\n{arch}",
                 "cache_control": {"type": "ephemeral"},
             }
-            log.info("Architecture context updated (%d chars) — LLM cache will refresh.", len(arch))
+            log.info(
+                "Architecture context refreshed (%d chars) — valid until 07:00 ET tomorrow.",
+                len(arch),
+            )
         else:
             self._arch_block = None
             log.warning("build_arch_summary() returned empty — falling back to generic RCA context.")
@@ -891,13 +951,12 @@ class LogMonitorAgent:
 
         The LLM is never called on a quiet cycle — zero API cost when nothing is wrong.
         """
-        # ── Codebase sync: detect deploys, refresh index if new commits landed ──
-        # One GitHub API call per cycle (HEAD SHA check). If the branch is unchanged
-        # this is a no-op. If a deploy happened, caches clear and the arch summary
-        # rebuilds automatically so every RCA call uses up-to-date source code.
+        # ── Daily codebase sync (once at CODEBASE_REFRESH_HOUR Eastern Time) ───
+        # No-op on every cycle except the first one after 7 AM ET each day.
+        # Zero GitHub API calls until the scheduled window opens.
         refreshed = self.rca.refresh_codebase()
         if refreshed:
-            log.info("✅  Codebase re-indexed — RCA will use the latest deployed code.")
+            log.info("✅  Codebase re-indexed — RCA context updated with today's code.")
 
         drain = DrainClusterer()  # fresh clusterer per cycle — each window is independent
         stats = CompressionStats()
