@@ -115,18 +115,32 @@ clusters: list[LogCluster]
 ```
 GitHub REST API  (one session, all responses in-memory cached)
      │
+     │  get_head_sha()       GET /repos/{owner}/{repo}/branches/{branch}
+     │                       returns commit SHA (1 lightweight call, NOT cached)
+     │                       Used by refresh_if_stale() every poll cycle to detect deploys.
+     │
+     │  refresh_if_stale()   called at the TOP of every daemon poll cycle
+     │     ├── get_head_sha() → compare with self._indexed_sha
+     │     ├── [same SHA]   → return False  (no-op — index still valid)
+     │     └── [new SHA]    → clear _tree cache + clear _files cache
+     │                         update _indexed_sha → return True
+     │                         (caller rebuilds arch summary with fresh data)
+     │
      │  _get_tree()          GET /repos/{owner}/{repo}/git/trees/{branch}?recursive=1
      │                       returns list[{path, type, sha, size}]  (1 API call, cached)
+     │                       cache cleared automatically on deploy detection
      │
      │  _read(path)          GET /repos/{owner}/{repo}/contents/{path}?ref={branch}
      │                       base64-decode → str  (per-file, cached)
+     │                       cache cleared automatically on deploy detection
      │
-     ├── build_arch_summary()                    called ONCE at agent startup
+     ├── build_arch_summary()       called at startup AND after each deploy detection
+     │     ├── snapshot HEAD SHA    establishes _indexed_sha baseline for refresh checks
      │     ├── language distribution             ext_counts from tree
      │     ├── top-level module list             unique dir[0] segments
-     │     ├── priority files                    README, configs, build files (≤2500 chars each)
+     │     ├── priority files       README, configs, build files (≤2500 chars each)
      │     └── error handler sources             *exception*/*handler*/*middleware* (≤1500 chars each)
-     │     → str (capped at MAX_ARCH_CHARS=6000)
+     │     → str (capped at MAX_ARCH_CHARS=6000)  includes commit SHA in header
      │     → stored as ephemeral-cached LLM system block
      │
      └── find_snippets(keywords)                 called PER CLUSTER
@@ -136,9 +150,31 @@ GitHub REST API  (one session, all responses in-memory cached)
            │     ├── static meaningful tokens (≥4 chars)
            │     └── identifier-shaped slot values
            ├── score source files by path-keyword overlap
-           ├── read top-10 scored files (from cache)
+           ├── read top-10 scored files (from refreshed cache after deploy)
            ├── grep each file → first keyword-hit line → ±20 line window
            └── return ≤5 snippets  (capped at MAX_SNIPPET_CHARS=2000)
+```
+
+**Deploy detection flow (per daemon cycle):**
+```
+run_once() called
+  │
+  └─ rca.refresh_codebase()
+       │
+       └─ indexer.refresh_if_stale()
+            │
+            ├─ GET /branches/{branch}  →  sha = "abc123ef..."
+            │
+            ├─ sha == _indexed_sha?
+            │    YES → return False  (1 API call total, no rebuild)
+            │
+            └─ NO  → log "New commit: old → new"
+                      _tree = None  (tree re-fetched on next _get_tree())
+                      _files.clear()  (all content re-fetched on next _read())
+                      _indexed_sha = sha
+                      return True
+                        └─ rca.refresh_codebase() calls build_arch_summary()
+                             → fresh tree + fresh files → new LLM system block
 ```
 
 ---

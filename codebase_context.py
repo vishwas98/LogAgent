@@ -139,6 +139,9 @@ class CodebaseIndexer:
 
         self._tree: list[dict] | None = None  # full file tree (cached)
         self._files: dict[str, str] = {}  # file contents (cached)
+        # HEAD SHA at the time the index was last built.
+        # Used by refresh_if_stale() to detect new commits without re-fetching everything.
+        self._indexed_sha: str | None = None
 
     # ── private helpers ───────────────────────────────────────────────────────
 
@@ -195,18 +198,91 @@ class CodebaseIndexer:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    def get_head_sha(self) -> str | None:
+        """
+        Return the current HEAD commit SHA for the configured branch.
+
+        One lightweight GitHub API call — used to detect deploys without
+        re-fetching the entire file tree.  Returns None on any failure so
+        callers can degrade gracefully (keep using the existing index).
+        """
+        try:
+            r = self._sess.get(
+                f"{self._api}/repos/{self.owner}/{self.repo}/branches/{self.branch}",
+                timeout=10,
+            )
+            r.raise_for_status()
+            return r.json().get("commit", {}).get("sha")
+        except Exception as exc:
+            log.debug(
+                "Could not fetch HEAD SHA for %s/%s@%s: %s",
+                self.owner,
+                self.repo,
+                self.branch,
+                exc,
+            )
+            return None
+
+    def refresh_if_stale(self) -> bool:
+        """
+        Detect new commits on the branch and invalidate the cache if found.
+
+        Called once per daemon poll cycle.  If the branch HEAD SHA has changed
+        since the last index build (i.e., a deploy landed):
+
+          • Clears _tree  (file-tree cache)    → next _get_tree() fetches fresh list
+          • Clears _files (content cache)      → next _read() fetches updated files
+          • Updates _indexed_sha to new SHA    → avoids repeated refreshes
+
+        Returns True  → new commits detected; caller must call build_arch_summary()
+                        to regenerate the LLM architecture context block.
+        Returns False → index is current (same SHA) OR the SHA check failed
+                        (network issue); existing cache is kept as-is.
+        """
+        current_sha = self.get_head_sha()
+        if not current_sha:
+            return False  # can't reach GitHub — keep using existing index
+
+        if current_sha == self._indexed_sha:
+            return False  # branch unchanged since last index — nothing to do
+
+        log.info(
+            "🔄  New commit on %s/%s@%s: %s → %s — invalidating codebase cache",
+            self.owner,
+            self.repo,
+            self.branch,
+            (self._indexed_sha or "none")[:8],
+            current_sha[:8],
+        )
+        # Invalidate both cache layers
+        self._tree = None
+        self._files.clear()
+        self._indexed_sha = current_sha
+        return True
+
     def build_arch_summary(self) -> str:
         """
-        Build a one-time architecture summary for use as an LLM system block.
+        Build (or rebuild) the architecture summary for use as an LLM system block.
+
+        Captures the HEAD SHA before fetching anything, establishing the baseline
+        for future refresh_if_stale() calls (first-time indexing or post-deploy rebuild).
 
         Sections:
-          1. Repo identity + language breakdown
+          1. Repo identity + language breakdown + indexed commit SHA
           2. Top-level module/package structure
           3. README & build files (capped per file)
           4. Error / exception handler source files (up to 3)
 
         Returns a single string, capped at MAX_ARCH_CHARS.
         """
+        # Snapshot HEAD SHA before reading any files — this is the commit we're indexing.
+        # If _indexed_sha is already set (called after refresh_if_stale), keep it.
+        if self._indexed_sha is None:
+            sha = self.get_head_sha()
+            if sha:
+                self._indexed_sha = sha
+                log.info("Indexing %s/%s@%s  commit %s", self.owner, self.repo, self.branch, sha[:8])
+
         all_paths = self._all_paths()
         path_set = set(all_paths)
 
@@ -221,8 +297,9 @@ class CodebaseIndexer:
         # Top-level directory/package names
         top_dirs = sorted({p.split("/")[0] for p in all_paths if "/" in p})
 
+        sha_label = f"  commit:{self._indexed_sha[:8]}" if self._indexed_sha else ""
         sections: list[str] = [
-            f"# {self.owner}/{self.repo}  branch:{self.branch}",
+            f"# {self.owner}/{self.repo}  branch:{self.branch}{sha_label}",
             f"Languages : {lang_str}",
             f"Total files: {len(all_paths)}",
             "Top-level modules:\n" + "\n".join(f"  {d}/" for d in top_dirs[:25]),

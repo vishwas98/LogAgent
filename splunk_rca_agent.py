@@ -627,6 +627,39 @@ class RCAAnalyzer:
                     len(arch),
                 )
 
+    def refresh_codebase(self) -> bool:
+        """
+        Check whether new commits have landed on the application repo branch since the
+        last index build.  If so, invalidate the file cache and rebuild the LLM
+        architecture context block so every subsequent RCA call uses up-to-date code.
+
+        Called once at the top of every daemon poll cycle — keeps the codebase context
+        in sync with whatever version is currently deployed without manual restarts.
+
+        Cost: 1 lightweight GitHub API call (branch HEAD SHA) per cycle.
+        If the SHA is unchanged → zero additional cost, returns False immediately.
+        If new commits detected → rebuilds arch summary (~5–15 GitHub API calls), returns True.
+        """
+        if not self._indexer:
+            return False
+
+        if not self._indexer.refresh_if_stale():
+            return False  # branch SHA unchanged — existing system block is still valid
+
+        log.info("Rebuilding LLM architecture context block from refreshed codebase…")
+        arch = self._indexer.build_arch_summary()
+        if arch:
+            self._arch_block = {
+                "type": "text",
+                "text": f"## Application Codebase Context\n\n{arch}",
+                "cache_control": {"type": "ephemeral"},
+            }
+            log.info("Architecture context updated (%d chars) — LLM cache will refresh.", len(arch))
+        else:
+            self._arch_block = None
+            log.warning("build_arch_summary() returned empty — falling back to generic RCA context.")
+        return True
+
     def _system_blocks(self) -> list[dict]:
         """
         Two cached system blocks:
@@ -858,6 +891,14 @@ class LogMonitorAgent:
 
         The LLM is never called on a quiet cycle — zero API cost when nothing is wrong.
         """
+        # ── Codebase sync: detect deploys, refresh index if new commits landed ──
+        # One GitHub API call per cycle (HEAD SHA check). If the branch is unchanged
+        # this is a no-op. If a deploy happened, caches clear and the arch summary
+        # rebuilds automatically so every RCA call uses up-to-date source code.
+        refreshed = self.rca.refresh_codebase()
+        if refreshed:
+            log.info("✅  Codebase re-indexed — RCA will use the latest deployed code.")
+
         drain = DrainClusterer()  # fresh clusterer per cycle — each window is independent
         stats = CompressionStats()
 
