@@ -11,16 +11,24 @@ After `pip install splunk-logagent`:
 """
 
 from __future__ import annotations
-import argparse, getpass, json, os, smtplib, sys, time
+
+import argparse
+import getpass
+import json
+import os
+import smtplib
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Config storage ────────────────────────────────────────────────────────────
-CONFIG_DIR    = Path.home() / ".logagent"
-CONFIG_FILE   = CONFIG_DIR  / "config.env"
-STATUS_FILE   = CONFIG_DIR  / "last_run.json"
+CONFIG_DIR = Path.home() / ".logagent"
+CONFIG_FILE = CONFIG_DIR / "config.env"
+STATUS_FILE = CONFIG_DIR / "last_run.json"
 
-_SECRET_KEYS  = {"SPLUNK_PASS", "ANTHROPIC_API_KEY", "SMTP_PASS", "GITHUB_TOKEN"}
+_SECRET_KEYS = {"SPLUNK_PASS", "ANTHROPIC_API_KEY", "SMTP_PASS", "GITHUB_TOKEN"}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _load() -> dict[str, str]:
@@ -37,10 +45,8 @@ def _load() -> dict[str, str]:
 
 def _save(cfg: dict[str, str]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(
-        "\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n"
-    )
-    CONFIG_FILE.chmod(0o600)          # owner-readable only
+    CONFIG_FILE.write_text("\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n")
+    CONFIG_FILE.chmod(0o600)  # owner-readable only
 
 
 def _apply(cfg: dict[str, str]) -> None:
@@ -56,7 +62,7 @@ def _prompt(
     required: bool = True,
 ) -> str:
     hint = f" [{default}]" if default and not secret else ""
-    fn   = getpass.getpass if secret else input
+    fn = getpass.getpass if secret else input
     while True:
         val = fn(f"  {label}{hint}: ").strip()
         if not val:
@@ -77,16 +83,22 @@ def _fail(msg: str = "") -> None:
 def _section(title: str) -> None:
     print(f"\n── {title} {'─' * max(0, 50 - len(title))}")
 
+
 # ── Connection tests ──────────────────────────────────────────────────────────
 def _test_splunk(cfg: dict) -> bool:
     print("  Splunk REST API … ", end="", flush=True)
     try:
-        import urllib3, requests, xml.etree.ElementTree as ET
+        import xml.etree.ElementTree as ET
+
+        import requests
+        import urllib3
+
         urllib3.disable_warnings()
         r = requests.post(
             f"{cfg['SPLUNK_HOST']}/services/auth/login",
             data={"username": cfg["SPLUNK_USER"], "password": cfg["SPLUNK_PASS"]},
-            verify=False, timeout=12,
+            verify=False,
+            timeout=12,
         )
         if r.ok and ET.fromstring(r.text).findtext(".//sessionKey"):
             _ok("authenticated")
@@ -101,6 +113,7 @@ def _test_anthropic(cfg: dict) -> bool:
     print("  Anthropic API … ", end="", flush=True)
     try:
         import anthropic
+
         anthropic.Anthropic(api_key=cfg["ANTHROPIC_API_KEY"]).messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=5,
@@ -121,7 +134,8 @@ def _test_smtp(cfg: dict) -> bool:
             int(cfg.get("SMTP_PORT", "587")),
             timeout=12,
         ) as s:
-            s.ehlo(); s.starttls()
+            s.ehlo()
+            s.starttls()
             s.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
         _ok("login OK")
         return True
@@ -136,10 +150,13 @@ def _test_github(cfg: dict) -> bool:
     print("  GitHub … ", end="", flush=True)
     try:
         import requests
+
         r = requests.get(
             f"https://api.github.com/repos/{cfg['GITHUB_REPO']}",
-            headers={"Authorization": f"Bearer {cfg['GITHUB_TOKEN']}",
-                     "Accept": "application/vnd.github+json"},
+            headers={
+                "Authorization": f"Bearer {cfg['GITHUB_TOKEN']}",
+                "Accept": "application/vnd.github+json",
+            },
             timeout=10,
         )
         if r.ok:
@@ -160,6 +177,7 @@ def _run_all_tests(cfg: dict) -> bool:
     ]
     return all(results)
 
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 def cmd_init() -> None:
     """Interactive setup wizard. Tests each connection before moving on."""
@@ -174,10 +192,10 @@ def cmd_init() -> None:
     # ── Splunk ────────────────────────────────────────────────────────────────
     _section("Splunk  (REST API, default port 8089)")
     print("  Need: host URL, admin credentials, index name.")
-    cfg["SPLUNK_HOST"]   = _prompt("REST URL",       existing.get("SPLUNK_HOST", "https://localhost:8089"))
-    cfg["SPLUNK_USER"]   = _prompt("Username",       existing.get("SPLUNK_USER", "admin"))
-    cfg["SPLUNK_PASS"]   = _prompt("Password",       secret=True)
-    cfg["SPLUNK_INDEX"]  = _prompt("Index",          existing.get("SPLUNK_INDEX", "main"))
+    cfg["SPLUNK_HOST"] = _prompt("REST URL", existing.get("SPLUNK_HOST", "https://localhost:8089"))
+    cfg["SPLUNK_USER"] = _prompt("Username", existing.get("SPLUNK_USER", "admin"))
+    cfg["SPLUNK_PASS"] = _prompt("Password", secret=True)
+    cfg["SPLUNK_INDEX"] = _prompt("Index", existing.get("SPLUNK_INDEX", "main"))
     cfg["LOOKBACK_MINS"] = _prompt("Lookback (min)", existing.get("LOOKBACK_MINS", "60"))
 
     print()
@@ -200,10 +218,10 @@ def cmd_init() -> None:
 
     cfg["SMTP_HOST"] = _prompt("SMTP host", existing.get("SMTP_HOST", "smtp.gmail.com"))
     cfg["SMTP_PORT"] = _prompt("SMTP port", existing.get("SMTP_PORT", "587"))
-    cfg["SMTP_USER"] = _prompt("Sender email",   existing.get("SMTP_USER", ""))
-    cfg["SMTP_PASS"] = _prompt("App password",   secret=True)
-    cfg["EMAIL_FROM"]= cfg["SMTP_USER"]
-    cfg["EMAIL_TO"]  = _prompt(
+    cfg["SMTP_USER"] = _prompt("Sender email", existing.get("SMTP_USER", ""))
+    cfg["SMTP_PASS"] = _prompt("App password", secret=True)
+    cfg["EMAIL_FROM"] = cfg["SMTP_USER"]
+    cfg["EMAIL_TO"] = _prompt(
         "Recipients (comma-separated)",
         existing.get("EMAIL_TO", ""),
     )
@@ -221,8 +239,8 @@ def cmd_init() -> None:
 
     github_token = _prompt("GitHub PAT (leave blank to skip)", secret=True, required=False)
     if github_token:
-        cfg["GITHUB_TOKEN"]  = github_token
-        cfg["GITHUB_REPO"]   = _prompt("App repo (owner/repo)", existing.get("GITHUB_REPO", ""))
+        cfg["GITHUB_TOKEN"] = github_token
+        cfg["GITHUB_REPO"] = _prompt("App repo (owner/repo)", existing.get("GITHUB_REPO", ""))
         cfg["GITHUB_BRANCH"] = _prompt("Branch", existing.get("GITHUB_BRANCH", "main"))
         print()
         _test_github(cfg)
@@ -233,9 +251,9 @@ def cmd_init() -> None:
     _save(cfg)
     print(f"\n{'─' * 54}")
     print(f"✅  Config saved → {CONFIG_FILE}")
-    print(f"\nNext steps:")
-    print(f"  logagent test    — re-run all connection checks")
-    print(f"  logagent run     — run the agent now")
+    print("\nNext steps:")
+    print("  logagent test    — re-run all connection checks")
+    print("  logagent run     — run the agent now")
     print()
 
 
@@ -269,6 +287,7 @@ def cmd_run() -> None:
     start = time.time()
     try:
         from splunk_rca_agent import LogMonitorAgent
+
         LogMonitorAgent().run()
         elapsed = time.time() - start
         _write_status("success", elapsed)
@@ -285,8 +304,8 @@ def cmd_status() -> None:
         print("No runs recorded yet. Run:  logagent run")
         return
     data = json.loads(STATUS_FILE.read_text())
-    ts   = data.get("timestamp", "unknown")
-    st   = data.get("status",    "unknown")
+    ts = data.get("timestamp", "unknown")
+    st = data.get("status", "unknown")
     secs = data.get("elapsed_s", 0)
     icon = "✅" if st == "success" else "❌"
     print(f"\n{icon}  Last run: {ts}  ({secs:.1f}s)  status={st}")
@@ -310,12 +329,18 @@ def cmd_config() -> None:
 
 def _write_status(status: str, elapsed: float, error: str = "") -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    STATUS_FILE.write_text(json.dumps({
-        "status":    status,
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "elapsed_s": round(elapsed, 1),
-        "error":     error,
-    }, indent=2))
+    STATUS_FILE.write_text(
+        json.dumps(
+            {
+                "status": status,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "elapsed_s": round(elapsed, 1),
+                "error": error,
+            },
+            indent=2,
+        )
+    )
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
@@ -341,9 +366,9 @@ quick start:
     args = p.parse_args()
 
     dispatch = {
-        "init":   cmd_init,
-        "run":    cmd_run,
-        "test":   cmd_test,
+        "init": cmd_init,
+        "run": cmd_run,
+        "test": cmd_test,
         "status": cmd_status,
         "config": cmd_config,
     }

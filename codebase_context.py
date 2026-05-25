@@ -26,9 +26,12 @@ Env vars (when used inside the agent):
 """
 
 from __future__ import annotations
-import os, re, base64, logging
+
+import base64
+import logging
+import os
+import re
 from collections import Counter
-from typing import Optional
 
 import requests
 import urllib3
@@ -37,40 +40,68 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 log = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-MAX_ARCH_CHARS    = int(os.environ.get("MAX_ARCH_CHARS",    "6000"))
+MAX_ARCH_CHARS = int(os.environ.get("MAX_ARCH_CHARS", "6000"))
 MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "2000"))
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 # Source extensions to index for snippet search
 _SRC_EXTS = {
-    ".py", ".java", ".js", ".ts", ".go", ".rb", ".cs",
-    ".scala", ".kt", ".rs", ".cpp", ".c", ".php", ".swift",
+    ".py",
+    ".java",
+    ".js",
+    ".ts",
+    ".go",
+    ".rb",
+    ".cs",
+    ".scala",
+    ".kt",
+    ".rs",
+    ".cpp",
+    ".c",
+    ".php",
+    ".swift",
 }
 
 # Priority files for architecture summary (checked in order)
 _ARCH_FILES = [
-    "README.md", "README.rst", "README.txt", "ARCHITECTURE.md",
-    "docker-compose.yml", "docker-compose.yaml",
-    "pyproject.toml", "setup.py", "requirements.txt",
-    "pom.xml", "build.gradle", "build.gradle.kts",
-    "package.json", "go.mod", "Cargo.toml",
-    "application.yml", "application.yaml", "application.properties",
-    "config.py", "settings.py", "config.yaml", "config.yml",
-    ".env.example", "Makefile",
+    "README.md",
+    "README.rst",
+    "README.txt",
+    "ARCHITECTURE.md",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "application.yml",
+    "application.yaml",
+    "application.properties",
+    "config.py",
+    "settings.py",
+    "config.yaml",
+    "config.yml",
+    ".env.example",
+    "Makefile",
 ]
 
 # Files whose name suggests error/exception handling
 _ERROR_FILE_RE = re.compile(
-    r'(?:exception|error|fault|handler|middleware|interceptor|filter|advice)',
+    r"(?:exception|error|fault|handler|middleware|interceptor|filter|advice)",
     re.I,
 )
 
 # Regex to find exception / service class names in log templates
 _CAMEL_CLASS_RE = re.compile(
-    r'\b[A-Z][a-zA-Z]+(?:Exception|Error|Failure|Service|Handler|'
-    r'Controller|Manager|Repository|Client|Gateway|Dao|Filter|Interceptor)\b'
+    r"\b[A-Z][a-zA-Z]+(?:Exception|Error|Failure|Service|Handler|"
+    r"Controller|Manager|Repository|Client|Gateway|Dao|Filter|Interceptor)\b"
 )
-_FQN_CLASS_RE = re.compile(r'(?:[\w]+\.)+([A-Z]\w+)')     # com.app.UserService → UserService
+_FQN_CLASS_RE = re.compile(r"(?:[\w]+\.)+([A-Z]\w+)")  # com.app.UserService → UserService
 
 
 # ── CODEBASE INDEXER ─────────────────────────────────────────────────────────
@@ -87,25 +118,27 @@ class CodebaseIndexer:
 
     def __init__(
         self,
-        token:  str,
-        owner:  str,
-        repo:   str,
+        token: str,
+        owner: str,
+        repo: str,
         branch: str = "main",
     ) -> None:
-        self.owner  = owner
-        self.repo   = repo
+        self.owner = owner
+        self.repo = repo
         self.branch = branch
 
         self._sess = requests.Session()
-        self._sess.headers.update({
-            "Authorization":        f"Bearer {token}",
-            "Accept":               "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        })
+        self._sess.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
         self._api = "https://api.github.com"
 
-        self._tree:  Optional[list[dict]] = None   # full file tree (cached)
-        self._files: dict[str, str]       = {}     # file contents (cached)
+        self._tree: list[dict] | None = None  # full file tree (cached)
+        self._files: dict[str, str] = {}  # file contents (cached)
 
     # ── private helpers ───────────────────────────────────────────────────────
 
@@ -122,7 +155,10 @@ class CodebaseIndexer:
         self._tree = [n for n in r.json().get("tree", []) if n["type"] == "blob"]
         log.info(
             "Indexed %d files from %s/%s@%s",
-            len(self._tree), self.owner, self.repo, self.branch,
+            len(self._tree),
+            self.owner,
+            self.repo,
+            self.branch,
         )
         return self._tree
 
@@ -155,10 +191,7 @@ class CodebaseIndexer:
         return [n["path"] for n in self._get_tree()]
 
     def _source_files(self) -> list[str]:
-        return [
-            p for p in self._all_paths()
-            if os.path.splitext(p)[1].lower() in _SRC_EXTS
-        ]
+        return [p for p in self._all_paths() if os.path.splitext(p)[1].lower() in _SRC_EXTS]
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -175,21 +208,18 @@ class CodebaseIndexer:
         Returns a single string, capped at MAX_ARCH_CHARS.
         """
         all_paths = self._all_paths()
-        path_set  = set(all_paths)
+        path_set = set(all_paths)
 
         # Language distribution
         ext_counts = Counter(
-            os.path.splitext(p)[1].lower() for p in all_paths
+            os.path.splitext(p)[1].lower()
+            for p in all_paths
             if os.path.splitext(p)[1].lower() in _SRC_EXTS
         )
-        lang_str = ", ".join(
-            f"{e}({c})" for e, c in ext_counts.most_common(6)
-        ) or "unknown"
+        lang_str = ", ".join(f"{e}({c})" for e, c in ext_counts.most_common(6)) or "unknown"
 
         # Top-level directory/package names
-        top_dirs = sorted({
-            p.split("/")[0] for p in all_paths if "/" in p
-        })
+        top_dirs = sorted({p.split("/")[0] for p in all_paths if "/" in p})
 
         sections: list[str] = [
             f"# {self.owner}/{self.repo}  branch:{self.branch}",
@@ -208,7 +238,8 @@ class CodebaseIndexer:
 
         # Error handler source files — crucial for RCA pattern matching
         err_files = [
-            p for p in all_paths
+            p
+            for p in all_paths
             if _ERROR_FILE_RE.search(os.path.basename(p))
             and os.path.splitext(p)[1].lower() in _SRC_EXTS
         ][:3]
@@ -282,12 +313,12 @@ class CodebaseIndexer:
         if not keywords:
             return ""
 
-        src     = self._source_files()
-        kw_low  = [k.lower() for k in keywords]
+        src = self._source_files()
+        kw_low = [k.lower() for k in keywords]
 
         def _score(path: str) -> int:
             pl = path.lower()
-            s  = sum(1 for k in kw_low if k in pl)
+            s = sum(1 for k in kw_low if k in pl)
             if _ERROR_FILE_RE.search(os.path.basename(path)):
                 s += 1
             return s
@@ -305,17 +336,17 @@ class CodebaseIndexer:
             for i, line in enumerate(lines):
                 ll = line.lower()
                 if any(k in ll for k in kw_low):
-                    start   = max(0, i - 5)
-                    end     = min(len(lines), i + context_lines)
-                    block   = "\n".join(lines[start:end])
-                    header  = f"# {path}  (line {i + 1})"
+                    start = max(0, i - 5)
+                    end = min(len(lines), i + context_lines)
+                    block = "\n".join(lines[start:end])
+                    header = f"# {path}  (line {i + 1})"
                     snippets.append(f"{header}\n{block}")
                     break  # one window per file
 
         if not snippets:
             return ""
 
-        sep    = "\n\n" + "─" * 60 + "\n\n"
+        sep = "\n\n" + "─" * 60 + "\n\n"
         joined = sep.join(snippets)
         if len(joined) > MAX_SNIPPET_CHARS:
             joined = joined[:MAX_SNIPPET_CHARS] + "\n…[snippets truncated]"
@@ -324,13 +355,13 @@ class CodebaseIndexer:
     # ── convenience ──────────────────────────────────────────────────────────
 
     @classmethod
-    def from_env(cls) -> Optional["CodebaseIndexer"]:
+    def from_env(cls) -> CodebaseIndexer | None:
         """
         Construct from standard env vars. Returns None if not configured.
         Expected:  GITHUB_TOKEN, GITHUB_REPO=owner/repo, GITHUB_BRANCH=main
         """
         token = os.environ.get("GITHUB_TOKEN", "")
-        repo  = os.environ.get("GITHUB_REPO",  "")
+        repo = os.environ.get("GITHUB_REPO", "")
         if not (token and repo):
             return None
         try:
@@ -346,6 +377,7 @@ class CodebaseIndexer:
 # ── CLI / standalone test ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
+
     idx = CodebaseIndexer.from_env()
     if not idx:
         print("Set GITHUB_TOKEN and GITHUB_REPO=owner/repo to run standalone test.")

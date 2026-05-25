@@ -33,17 +33,22 @@ Optional env vars (defaults shown):
 """
 
 from __future__ import annotations
-import os, re, json, smtplib, logging, hashlib
-from datetime import datetime, timezone
+
+import hashlib
+import json
+import logging
+import os
+import re
+import smtplib
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from collections import defaultdict, Counter
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
 
-import urllib3
-import requests
 import anthropic
+import requests
+import urllib3
 
 from codebase_context import CodebaseIndexer
 
@@ -52,45 +57,46 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-SPLUNK_HOST      = os.environ.get("SPLUNK_HOST",       "https://localhost:8089")
-SPLUNK_USER      = os.environ.get("SPLUNK_USER",       "admin")
-SPLUNK_PASS      = os.environ.get("SPLUNK_PASS",       "")
-SPLUNK_INDEX     = os.environ.get("SPLUNK_INDEX",      "main")
-LOOKBACK_MINS    = int(os.environ.get("LOOKBACK_MINS",    "60"))
-MAX_LOG_RESULTS  = int(os.environ.get("MAX_LOG_RESULTS",  "5000"))
+SPLUNK_HOST = os.environ.get("SPLUNK_HOST", "https://localhost:8089")
+SPLUNK_USER = os.environ.get("SPLUNK_USER", "admin")
+SPLUNK_PASS = os.environ.get("SPLUNK_PASS", "")
+SPLUNK_INDEX = os.environ.get("SPLUNK_INDEX", "main")
+LOOKBACK_MINS = int(os.environ.get("LOOKBACK_MINS", "60"))
+MAX_LOG_RESULTS = int(os.environ.get("MAX_LOG_RESULTS", "5000"))
 MAX_LLM_CLUSTERS = int(os.environ.get("MAX_LLM_CLUSTERS", "20"))
 
-LLM_MODEL        = "claude-opus-4-7"
-ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_MODEL = "claude-opus-4-7"
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-SMTP_HOST        = os.environ.get("SMTP_HOST",  "smtp.gmail.com")
-SMTP_PORT        = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER        = os.environ.get("SMTP_USER",  "")
-SMTP_PASS        = os.environ.get("SMTP_PASS",  "")
-EMAIL_FROM       = os.environ.get("EMAIL_FROM", SMTP_USER)
-EMAIL_TO         = os.environ.get("EMAIL_TO",   "devteam@example.com")
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", "devteam@example.com")
 
 # Drain params
-SIM_THRESHOLD    = float(os.environ.get("DRAIN_SIM",       "0.5"))
-DRAIN_DEPTH      = int(os.environ.get("DRAIN_DEPTH",       "4"))
-MAX_CHILDREN     = int(os.environ.get("DRAIN_MAX_CHILD",   "100"))
-MERGE_SIM        = float(os.environ.get("MERGE_SIM",       "0.8"))   # [4] second-pass merger
+SIM_THRESHOLD = float(os.environ.get("DRAIN_SIM", "0.5"))
+DRAIN_DEPTH = int(os.environ.get("DRAIN_DEPTH", "4"))
+MAX_CHILDREN = int(os.environ.get("DRAIN_MAX_CHILD", "100"))
+MERGE_SIM = float(os.environ.get("MERGE_SIM", "0.8"))  # [4] second-pass merger
 
 # Token budget params
-LLM_BUDGET_CHARS = int(os.environ.get("LLM_BUDGET_CHARS", "3500"))   # [6] total user prompt cap
-MAX_SLOT_VALS    = int(os.environ.get("MAX_SLOT_VALS",     "5"))      # [5] values per slot
+LLM_BUDGET_CHARS = int(os.environ.get("LLM_BUDGET_CHARS", "3500"))  # [6] total user prompt cap
+MAX_SLOT_VALS = int(os.environ.get("MAX_SLOT_VALS", "5"))  # [5] values per slot
 
-ANOMALY_RE       = re.compile(r"\b(ERROR|EXCEPTION|FAILED|CRITICAL|FATAL)\b", re.I)
+ANOMALY_RE = re.compile(r"\b(ERROR|EXCEPTION|FAILED|CRITICAL|FATAL)\b", re.I)
+
 
 # ── COMPRESSION STATS ─────────────────────────────────────────────────────────
 @dataclass
 class CompressionStats:
-    raw:          int = 0   # lines from Splunk
-    unique:       int = 0   # after exact dedup  [1]
-    compressed:   int = 0   # after stack compactor [2]
-    clusters:     int = 0   # after Drain  [3/4]
-    merged:       int = 0   # after second-pass merge [5]
-    llm_sent:     int = 0   # clusters actually analyzed
+    raw: int = 0  # lines from Splunk
+    unique: int = 0  # after exact dedup  [1]
+    compressed: int = 0  # after stack compactor [2]
+    clusters: int = 0  # after Drain  [3/4]
+    merged: int = 0  # after second-pass merge [5]
+    llm_sent: int = 0  # clusters actually analyzed
 
     @property
     def total_ratio(self) -> str:
@@ -105,11 +111,13 @@ class CompressionStats:
             f"[total {self.total_ratio} compression]"
         )
 
+
 # ── [2] STACK TRACE COMPRESSOR ────────────────────────────────────────────────
-_JAVA_FRAME  = re.compile(r'\n?\s*at [\w.$<>]+\([\w.]+(?::\d+)?\)')
-_PY_FRAME    = re.compile(r'\n?\s*File "[^"]+", line \d+(?:, in \w+)?')
-_CAUSED_BY   = re.compile(r'(?:Caused by|caused by): ?[^\n]+')
-_EXC_CLASS   = re.compile(r'[\w.$]+(?:Exception|Error|Fault|Failure|Warning)[^\n]{0,120}')
+_JAVA_FRAME = re.compile(r"\n?\s*at [\w.$<>]+\([\w.]+(?::\d+)?\)")
+_PY_FRAME = re.compile(r'\n?\s*File "[^"]+", line \d+(?:, in \w+)?')
+_CAUSED_BY = re.compile(r"(?:Caused by|caused by): ?[^\n]+")
+_EXC_CLASS = re.compile(r"[\w.$]+(?:Exception|Error|Fault|Failure|Warning)[^\n]{0,120}")
+
 
 def compress_stacktrace(line: str) -> str:
     """
@@ -125,9 +133,9 @@ def compress_stacktrace(line: str) -> str:
         first = norm.find("\tat ")
         header = norm[:first].strip() if first > 0 else norm[:200]
         causes = _CAUSED_BY.findall(norm)
-        kept   = [f.strip() for f in java_frames[:2]]
-        omit   = max(0, len(java_frames) - 2)
-        parts  = [header] + kept
+        kept = [f.strip() for f in java_frames[:2]]
+        omit = max(0, len(java_frames) - 2)
+        parts = [header] + kept
         if omit:
             parts.append(f"…[{omit} frames omitted]")
         parts.extend(causes[:2])
@@ -136,9 +144,9 @@ def compress_stacktrace(line: str) -> str:
     # ── Python
     py_frames = _PY_FRAME.findall(norm)
     if py_frames:
-        exc   = _EXC_CLASS.search(norm)
-        kept  = [f.strip() for f in py_frames[:2]]
-        omit  = max(0, len(py_frames) - 2)
+        exc = _EXC_CLASS.search(norm)
+        kept = [f.strip() for f in py_frames[:2]]
+        omit = max(0, len(py_frames) - 2)
         parts = ([exc.group(0)[:150]] if exc else []) + kept
         if omit:
             parts.append(f"…[{omit} frames omitted]")
@@ -146,27 +154,32 @@ def compress_stacktrace(line: str) -> str:
 
     return line  # not a stack trace
 
+
 # ── [3] TOKENIZER (base + extended patterns) ─────────────────────────────────
 _VAR_SUBS: list[tuple[re.Pattern, str]] = [
     # --- Base patterns (high specificity first) ---
-    (re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b'),                      "<IP>"),
-    (re.compile(r'\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b', re.I),     "<UUID>"),
-    (re.compile(r'\b[0-9a-fA-F]{16,}\b'),                                        "<HEX>"),
-    (re.compile(r'\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b'),   "<TS>"),
-    (re.compile(r'\b\d{10,13}\b'),                                                "<EPOCH>"),
-    (re.compile(r'/[\w./\-]{4,}'),                                                "<PATH>"),
-    (re.compile(r'\b[\w.+-]+@[\w.-]+\.\w+\b'),                                   "<EMAIL>"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"), "<IP>"),
+    (re.compile(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", re.I), "<UUID>"),
+    (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<HEX>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b"), "<TS>"),
+    (re.compile(r"\b\d{10,13}\b"), "<EPOCH>"),
+    (re.compile(r"/[\w./\-]{4,}"), "<PATH>"),
+    (re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b"), "<EMAIL>"),
     # --- [3] Extended patterns ---
     # key=value pairs: user_id=abc123, status=500, duration=342ms
-    (re.compile(r'(?<!\w)[\w.\-]{2,24}=(?:[^\s,;{}\[\]"\']{1,40})'),            "<KV>"),
+    (re.compile(r'(?<!\w)[\w.\-]{2,24}=(?:[^\s,;{}\[\]"\']{1,40})'), "<KV>"),
     # double / single quoted strings (3–80 chars)
-    (re.compile(r'"[^"\\]{3,80}"'),                                               "<STR>"),
-    (re.compile(r"'[^'\\]{3,80}'"),                                               "<STR>"),
+    (re.compile(r'"[^"\\]{3,80}"'), "<STR>"),
+    (re.compile(r"'[^'\\]{3,80}'"), "<STR>"),
     # thread / connection / session / transaction identifiers
-    (re.compile(r'\b(?:thread|conn|session|txn|req|task|job)[-_]?[A-Za-z0-9]{4,}\b', re.I), "<TID>"),
+    (
+        re.compile(r"\b(?:thread|conn|session|txn|req|task|job)[-_]?[A-Za-z0-9]{4,}\b", re.I),
+        "<TID>",
+    ),
     # generic large numbers last
-    (re.compile(r'\b\d+\b'),                                                      "<NUM>"),
+    (re.compile(r"\b\d+\b"), "<NUM>"),
 ]
+
 
 def _tokenize(line: str) -> list[str]:
     """Apply all substitutions, split, cap at 64 tokens."""
@@ -174,15 +187,16 @@ def _tokenize(line: str) -> list[str]:
         line = pat.sub(tok, line)
     return line.split()[:64]
 
+
 # ── DATA MODEL ───────────────────────────────────────────────────────────────
 @dataclass
 class LogCluster:
-    template:    list[str]
-    raw_samples: list[str]             = field(default_factory=list)
+    template: list[str]
+    raw_samples: list[str] = field(default_factory=list)
     # [5] variable slot tracker: {token_position → [distinct_values_seen]}
-    var_slots:   dict[int, list[str]]  = field(default_factory=dict)
-    count:       int                   = 0
-    severity:    str                   = "ERROR"
+    var_slots: dict[int, list[str]] = field(default_factory=dict)
+    count: int = 0
+    severity: str = "ERROR"
 
     @property
     def template_str(self) -> str:
@@ -192,14 +206,17 @@ class LogCluster:
     def cluster_id(self) -> str:
         return hashlib.md5(self.template_str.encode()).hexdigest()[:8]
 
+
 # ── [4] DRAIN CLUSTERER ───────────────────────────────────────────────────────
 def _sim(a: list[str], b: list[str]) -> float:
     if len(a) != len(b):
         return 0.0
-    return sum(x == y for x, y in zip(a, b)) / len(a)
+    return sum(x == y for x, y in zip(a, b, strict=False)) / len(a)
+
 
 def _merge_tpl(a: list[str], b: list[str]) -> list[str]:
-    return [x if x == y else "<*>" for x, y in zip(a, b)]
+    return [x if x == y else "<*>" for x, y in zip(a, b, strict=False)]
+
 
 class DrainClusterer:
     """
@@ -210,14 +227,10 @@ class DrainClusterer:
     """
 
     def __init__(self) -> None:
-        self._tree: dict[int, dict[str, list[LogCluster]]] = \
-            defaultdict(lambda: defaultdict(list))
+        self._tree: dict[int, dict[str, list[LogCluster]]] = defaultdict(lambda: defaultdict(list))
 
     def _prefix_key(self, tokens: list[str]) -> str:
-        return " ".join(
-            t if not t.startswith("<") else "<*>"
-            for t in tokens[:DRAIN_DEPTH]
-        )
+        return " ".join(t if not t.startswith("<") else "<*>" for t in tokens[:DRAIN_DEPTH])
 
     def _severity(self, line: str) -> str:
         m = ANOMALY_RE.search(line)
@@ -225,7 +238,7 @@ class DrainClusterer:
 
     def _track_slots(self, cluster: LogCluster, tokens: list[str]) -> None:
         """Record dynamic values at positions where template diverges."""
-        for i, (tmpl_tok, new_tok) in enumerate(zip(cluster.template, tokens)):
+        for i, (tmpl_tok, new_tok) in enumerate(zip(cluster.template, tokens, strict=False)):
             if tmpl_tok != new_tok:
                 slot = cluster.var_slots.setdefault(i, [])
                 # Capture original value on first divergence
@@ -234,12 +247,12 @@ class DrainClusterer:
                 if new_tok not in slot and len(slot) < MAX_SLOT_VALS:
                     slot.append(new_tok[:30])
 
-    def add(self, raw: str, weight: int = 1) -> Optional[LogCluster]:
+    def add(self, raw: str, weight: int = 1) -> LogCluster | None:
         tokens = _tokenize(raw)
         if not tokens:
             return None
 
-        bucket   = self._tree[len(tokens)][self._prefix_key(tokens)]
+        bucket = self._tree[len(tokens)][self._prefix_key(tokens)]
         best, best_sim = None, -1.0
         for c in bucket:
             s = _sim(c.template, tokens)
@@ -247,9 +260,9 @@ class DrainClusterer:
                 best_sim, best = s, c
 
         if best_sim >= SIM_THRESHOLD and best:
-            self._track_slots(best, tokens)          # [5] track before merge
+            self._track_slots(best, tokens)  # [5] track before merge
             best.template = _merge_tpl(best.template, tokens)
-            best.count   += weight
+            best.count += weight
             if len(best.raw_samples) < 3:
                 best.raw_samples.append(raw[:300])
         else:
@@ -269,9 +282,8 @@ class DrainClusterer:
         for line, weight in weighted.items():
             if ANOMALY_RE.search(line):
                 self.add(line, weight)
-        return [c for by_len in self._tree.values()
-                  for cs in by_len.values()
-                  for c in cs]
+        return [c for by_len in self._tree.values() for cs in by_len.values() for c in cs]
+
 
 # ── [5] POST-DRAIN CLUSTER MERGER ─────────────────────────────────────────────
 def merge_clusters(clusters: list[LogCluster]) -> list[LogCluster]:
@@ -290,12 +302,12 @@ def merge_clusters(clusters: list[LogCluster]) -> list[LogCluster]:
         for i, base in enumerate(group):
             if id(base) in absorbed:
                 continue
-            for cand in group[i + 1:]:
+            for cand in group[i + 1 :]:
                 if id(cand) in absorbed:
                     continue
                 if _sim(base.template, cand.template) >= MERGE_SIM:
                     base.template = _merge_tpl(base.template, cand.template)
-                    base.count   += cand.count
+                    base.count += cand.count
                     base.raw_samples = (base.raw_samples + cand.raw_samples)[:3]
                     # Merge var slots
                     for pos, vals in cand.var_slots.items():
@@ -307,19 +319,21 @@ def merge_clusters(clusters: list[LogCluster]) -> list[LogCluster]:
             merged.append(base)
     return merged
 
+
 # ── SPLUNK CLIENT ─────────────────────────────────────────────────────────────
 class SplunkClient:
     """REST-only Splunk client. No splunk-sdk dependency."""
 
     def __init__(self) -> None:
-        self._sess  = requests.Session()
-        self._sess.verify = False       # replace with cert path in prod
-        self._token: Optional[str] = None
+        self._sess = requests.Session()
+        self._sess.verify = False  # replace with cert path in prod
+        self._token: str | None = None
 
     @property
     def _auth_token(self) -> str:
         if not self._token:
             import xml.etree.ElementTree as ET
+
             r = self._sess.post(
                 f"{SPLUNK_HOST}/services/auth/login",
                 data={"username": SPLUNK_USER, "password": SPLUNK_PASS},
@@ -335,19 +349,23 @@ class SplunkClient:
     def fetch_anomalies(self) -> list[str]:
         spl = (
             f'search index="{SPLUNK_INDEX}" earliest=-{LOOKBACK_MINS}m '
-            f'(ERROR OR EXCEPTION OR FAILED OR CRITICAL OR FATAL) '
-            f'| head {MAX_LOG_RESULTS} | fields _raw'
+            f"(ERROR OR EXCEPTION OR FAILED OR CRITICAL OR FATAL) "
+            f"| head {MAX_LOG_RESULTS} | fields _raw"
         )
         r = self._sess.post(
             f"{SPLUNK_HOST}/services/search/jobs",
             headers=self._hdrs(),
-            data={"search": spl, "output_mode": "json",
-                  "exec_mode": "blocking", "max_count": MAX_LOG_RESULTS},
+            data={
+                "search": spl,
+                "output_mode": "json",
+                "exec_mode": "blocking",
+                "max_count": MAX_LOG_RESULTS,
+            },
             timeout=180,
         )
         r.raise_for_status()
         sid = r.json()["sid"]
-        r2  = self._sess.get(
+        r2 = self._sess.get(
             f"{SPLUNK_HOST}/services/search/jobs/{sid}/results",
             headers=self._hdrs(),
             params={"output_mode": "json", "count": MAX_LOG_RESULTS},
@@ -355,6 +373,7 @@ class SplunkClient:
         )
         r2.raise_for_status()
         return [row["_raw"] for row in r2.json().get("results", []) if row.get("_raw")]
+
 
 # ── LLM RCA ANALYZER ─────────────────────────────────────────────────────────
 _SYS_PERSONA = (
@@ -412,21 +431,24 @@ class RCAAnalyzer:
       User message   — Template + var slots + per-cluster code snippets
     """
 
-    def __init__(self, indexer: Optional[CodebaseIndexer] = None) -> None:
-        self._client  = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    def __init__(self, indexer: CodebaseIndexer | None = None) -> None:
+        self._client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         self._indexer = indexer
-        self._arch_block: Optional[dict] = None
+        self._arch_block: dict | None = None
 
         if indexer:
             log.info("Building codebase architecture summary from GitHub…")
             arch = indexer.build_arch_summary()
             if arch:
                 self._arch_block = {
-                    "type":          "text",
-                    "text":          f"## Application Codebase Context\n\n{arch}",
-                    "cache_control": {"type": "ephemeral"},   # cached across all clusters
+                    "type": "text",
+                    "text": f"## Application Codebase Context\n\n{arch}",
+                    "cache_control": {"type": "ephemeral"},  # cached across all clusters
                 }
-                log.info("Architecture summary ready (%d chars, will be cached by LLM)", len(arch))
+                log.info(
+                    "Architecture summary ready (%d chars, will be cached by LLM)",
+                    len(arch),
+                )
 
     def _system_blocks(self) -> list[dict]:
         """
@@ -434,11 +456,13 @@ class RCAAnalyzer:
           [0] persona — tiny, always present
           [1] arch    — large, reused across all N cluster calls (ephemeral cache TTL=5min)
         """
-        blocks: list[dict] = [{
-            "type":          "text",
-            "text":          _SYS_PERSONA,
-            "cache_control": {"type": "ephemeral"},
-        }]
+        blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": _SYS_PERSONA,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
         if self._arch_block:
             blocks.append(self._arch_block)
         return blocks
@@ -475,16 +499,20 @@ class RCAAnalyzer:
             return json.loads(raw)
         except json.JSONDecodeError:
             return {
-                "summary":           "RCA parse failed.",
+                "summary": "RCA parse failed.",
                 "technical_context": raw[:300],
-                "root_cause":        "Unknown",
-                "action_items":      ["Review logs manually."],
+                "root_cause": "Unknown",
+                "action_items": ["Review logs manually."],
             }
+
 
 # ── EMAIL REPORTER ────────────────────────────────────────────────────────────
 _SEV_COLOR = {
-    "CRITICAL": "#f38ba8", "FATAL": "#f38ba8",
-    "ERROR":    "#fab387", "EXCEPTION": "#f9e2af", "FAILED": "#89b4fa",
+    "CRITICAL": "#f38ba8",
+    "FATAL": "#f38ba8",
+    "ERROR": "#fab387",
+    "EXCEPTION": "#f9e2af",
+    "FAILED": "#89b4fa",
 }
 
 _CARD = """\
@@ -549,7 +577,7 @@ class EmailReporter:
     ) -> None:
         cards = ""
         for c in sorted(clusters, key=lambda x: -x.count):
-            rca   = analyses.get(c.cluster_id, {})
+            rca = analyses.get(c.cluster_id, {})
             color = _SEV_COLOR.get(c.severity, "#89dceb")
             items = "".join(f"<li>{a}</li>" for a in rca.get("action_items", []))
             cards += _CARD.format(
@@ -558,13 +586,13 @@ class EmailReporter:
                 cluster_id=c.cluster_id,
                 count=c.count,
                 template=c.template_str[:250],
-                summary=rca.get("summary",           "N/A"),
+                summary=rca.get("summary", "N/A"),
                 technical_context=rca.get("technical_context", "N/A"),
-                root_cause=rca.get("root_cause",     "N/A"),
+                root_cause=rca.get("root_cause", "N/A"),
                 action_items=items,
             )
 
-        now  = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
         body = _WRAPPER.format(
             dt=now.strftime("%Y-%m-%d %H:%M UTC"),
             index=SPLUNK_INDEX,
@@ -581,7 +609,7 @@ class EmailReporter:
             f"{stats.total_ratio} compression | {now:%Y-%m-%d %H:%M} UTC"
         )
         msg["From"] = EMAIL_FROM
-        msg["To"]   = EMAIL_TO
+        msg["To"] = EMAIL_TO
         msg.attach(MIMEText(body, "html"))
 
         recipients = [e.strip() for e in EMAIL_TO.split(",")]
@@ -592,6 +620,7 @@ class EmailReporter:
             srv.sendmail(EMAIL_FROM, recipients, msg.as_string())
         log.info("Report sent → %s", EMAIL_TO)
 
+
 # ── ORCHESTRATOR ─────────────────────────────────────────────────────────────
 class LogMonitorAgent:
     """
@@ -601,8 +630,8 @@ class LogMonitorAgent:
     """
 
     def __init__(self) -> None:
-        self.splunk   = SplunkClient()
-        self.drain    = DrainClusterer()
+        self.splunk = SplunkClient()
+        self.drain = DrainClusterer()
         self.reporter = EmailReporter()
 
         # Codebase indexer: optional but strongly recommended for accurate RCA.
@@ -629,8 +658,12 @@ class LogMonitorAgent:
         # ── [1] Pre-deduplication: collapse identical lines, keep weights
         dedup: dict[str, int] = dict(Counter(raw_lines))
         stats.unique = len(dedup)
-        log.info("[1] dedup: %d → %d unique lines (%.1fx)",
-                 stats.raw, stats.unique, stats.raw / max(stats.unique, 1))
+        log.info(
+            "[1] dedup: %d → %d unique lines (%.1fx)",
+            stats.raw,
+            stats.unique,
+            stats.raw / max(stats.unique, 1),
+        )
 
         # ── [2] Stack trace compression on unique lines
         compressed: dict[str, int] = {}
@@ -648,8 +681,12 @@ class LogMonitorAgent:
         # ── [4] Post-drain merge
         clusters = merge_clusters(clusters)
         stats.merged = len(clusters)
-        log.info("[4] merge: %d → %d clusters (%.1fx further)",
-                 stats.clusters, stats.merged, stats.clusters / max(stats.merged, 1))
+        log.info(
+            "[4] merge: %d → %d clusters (%.1fx further)",
+            stats.clusters,
+            stats.merged,
+            stats.clusters / max(stats.merged, 1),
+        )
 
         if not clusters:
             log.info("Zero clusters after merge. Exiting.")
@@ -664,18 +701,29 @@ class LogMonitorAgent:
         analyses: dict[str, dict] = {}
         code_ctx = "on" if self.rca._indexer else "off"
         for i, c in enumerate(top, 1):
-            log.info("[%d/%d] RCA %s sev=%s ×%d slots=%d code-ctx=%s",
-                     i, len(top), c.cluster_id, c.severity,
-                     c.count, len(c.var_slots), code_ctx)
+            log.info(
+                "[%d/%d] RCA %s sev=%s ×%d slots=%d code-ctx=%s",
+                i,
+                len(top),
+                c.cluster_id,
+                c.severity,
+                c.count,
+                len(c.var_slots),
+                code_ctx,
+            )
             analyses[c.cluster_id] = self.rca.analyze(c)
 
         self.reporter.send(top, analyses, stats)
         log.info("Done.")
 
+
 # ── ENTRY POINT ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    missing = [v for v in ("SPLUNK_PASS", "ANTHROPIC_API_KEY", "SMTP_USER", "SMTP_PASS")
-               if not os.environ.get(v)]
+    missing = [
+        v
+        for v in ("SPLUNK_PASS", "ANTHROPIC_API_KEY", "SMTP_USER", "SMTP_PASS")
+        if not os.environ.get(v)
+    ]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
     LogMonitorAgent().run()
