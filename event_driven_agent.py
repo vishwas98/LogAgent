@@ -43,6 +43,7 @@ Additional env vars (beyond base agent):
 from __future__ import annotations
 
 import http.server
+import socketserver
 import json
 import logging
 import os
@@ -377,8 +378,17 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         log.debug("HTTP %s", fmt % args)
 
 
-class _WebhookServer(http.server.HTTPServer):
-    """HTTPServer that carries the shared buffer + secret for the handler."""
+class _WebhookServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """
+    HTTPServer that carries the shared buffer + secret for the handler.
+
+    ThreadingMixIn gives each request its own thread so that concurrent
+    Splunk alert POSTs (e.g. from multiple saved searches) never queue
+    behind each other.  daemon_threads=True ensures worker threads exit
+    cleanly when the main thread shuts down.
+    """
+
+    daemon_threads = True  # worker threads exit when main thread exits
 
     def __init__(
         self,
