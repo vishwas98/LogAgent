@@ -2,7 +2,11 @@
 
 Splunk anomaly monitor with **codebase-aware LLM root cause analysis**.
 
-Fetches error logs → compresses with 6-stage Drain pipeline → reads your GitHub repo → generates code-specific RCA with Claude → emails a structured HTML report.
+Two operating modes:
+- **Polling daemon** — polls Splunk every hour, emails when new error patterns appear.
+- **Event-driven** — Splunk webhook triggers real-time analysis seconds after an error burst settles.
+
+Both modes share the same 6-stage compression pipeline and produce the same HTML email report.
 
 ---
 
@@ -34,7 +38,7 @@ The agent reads your actual GitHub repo before analyzing logs. Instead of "check
 > Root cause: `src/db/ConnectionPool.java:87` — `pool.isEmpty()` throws `PoolExhaustedException` when all 20 connections are in use. The pool size is hardcoded in `application.yml: db.pool.max=20`.
 
 **2. Extreme compression before the LLM sees anything**  
-Six-stage pipeline reduces 5,000 raw log lines to ~17 representative cluster templates before a single token reaches Claude. This makes analysis fast and cheap.
+The shared `compress_events()` pipeline reduces 5,000 raw log lines to ~17 representative cluster templates before a single token reaches Claude. This makes analysis fast and cheap.
 
 ```
 5,000 raw lines
@@ -120,18 +124,22 @@ Credentials are stored at `~/.logagent/config.env` (chmod 600 — owner-readable
 
 ---
 
-## How the continuous daemon works
+## Operating modes
+
+### Mode 1 — Polling daemon (default)
 
 ```
 logagent run
      │
      └─ every POLL_INTERVAL_SECS (default: 1 hour)
           │
-          ├─ fetch Splunk — any ERROR/EXCEPTION/FAILED/CRITICAL/FATAL?
+          ├─ Two-pass Splunk fetch:
+          │    Pass 1: discover error events + stream timestamps
+          │    Pass 2: batch context window fetch for all affected streams
           │
-          ├─ [NO]  → "All quiet" log line. Zero API calls. Waits for next cycle.
+          ├─ [NO errors]  → "All quiet" log line. Zero API calls. Waits for next cycle.
           │
-          └─ [YES] → 6-stage compression pipeline
+          └─ [YES] → compress_events() — 6-stage shared pipeline
                       → cluster deduplication (already reported within DEDUP_WINDOW_MINS?)
                            │
                            ├─ [all known] → "No new patterns" log. Zero API calls.
@@ -139,11 +147,49 @@ logagent run
                            └─ [new patterns] → LLM RCA → email alert → back to sleep
 ```
 
-Key behaviour:
-- **Zero cost when healthy** — LLM is never called if there are no errors.
-- **No alert storms** — same error pattern reported at most once per `DEDUP_WINDOW_MINS` (default: 2 h). You won't get 24 emails about the same DB timeout.
-- **Resilient** — if Splunk is unreachable, the cycle logs the error and retries next interval. The daemon never crashes.
-- **Graceful shutdown** — `Ctrl+C` or `SIGTERM` completes the current cycle, then exits cleanly.
+### Mode 2 — Event-driven (real-time, sub-minute latency)
+
+```
+Splunk saved search (checks every 1 min)
+     │  POST /webhook with error event JSON
+     ▼
+_WebhookServer  (HTTP server on :8765)
+     │  parse + validate
+     ▼
+IncidentBuffer  (per-stream debounce)
+     │  accumulates events per (host, source) stream
+     │  fires when: silence >= POST_WINDOW_SECS (2 min)  ← normal burst settled
+     │           OR: age   >= MAX_WINDOW_SECS (10 min)   ← hard cap for noisy streams
+     ▼
+Worker thread (ThreadPoolExecutor, 3 workers)
+     │  fetch_context_for_stream() — targeted single-stream SPL
+     │  compress_events()          — same 6-stage pipeline as polling mode
+     │  dedup check
+     ▼
+LLM RCA → email alert
+```
+
+**Latency comparison:**
+| Mode | Time to first alert |
+|---|---|
+| Polling (default) | Up to `POLL_INTERVAL_SECS` (default: 60 min) |
+| Event-driven | `POST_WINDOW_SECS` after the last error in the burst (default: 2 min) |
+
+To start the event-driven agent:
+```bash
+python event_driven_agent.py
+```
+
+**One-time Splunk setup** (create a Saved Search):
+```
+SPL: search index="<INDEX>" earliest=-1m
+       (ERROR OR EXCEPTION OR FAILED OR CRITICAL OR FATAL)
+     | head 1 | fields _time host source _raw
+
+Alert:  trigger when "Number of Results > 0", check every 1 minute
+Action: Webhook → http://<logagent-host>:8765/webhook
+        (Optional) Authorization: <WEBHOOK_SECRET>
+```
 
 ---
 
@@ -182,6 +228,12 @@ docker run --rm \
 ```bash
 logagent run        # blocks — stays alive until Ctrl+C or SIGTERM
 ```
+
+Key behaviour:
+- **Zero cost when healthy** — LLM is never called if there are no errors.
+- **No alert storms** — same error pattern reported at most once per `DEDUP_WINDOW_MINS` (default: 2 h). You won't get 24 emails about the same DB timeout.
+- **Resilient** — if Splunk is unreachable, the cycle logs the error and retries next interval. The daemon never crashes.
+- **Graceful shutdown** — `Ctrl+C` or `SIGTERM` completes the current cycle, then exits cleanly.
 
 **Systemd service (Linux):**
 ```ini
@@ -263,7 +315,12 @@ Subject line includes compression ratio:
 
 ```
 Splunk REST API
-  │  fetch (ERROR / EXCEPTION / FAILED / CRITICAL / FATAL)
+  │
+  │  [Two-pass fetch]
+  │  Pass 1: error discovery → (host, source, first_error_time) per stream
+  │  Pass 2: batch context window [first_error - 5min, first_error + 2min] per stream
+  │
+  │  compress_events()  ← shared by polling + event-driven modes
   │
   ├─[1] Pre-dedup        Counter-hash exact duplicates → weighted lines
   ├─[2] Stack compressor Java/Python frame collapse → 2 kept + N omitted
@@ -277,8 +334,8 @@ Splunk REST API
   │    find_snippets(kws)   → per-cluster code snippet → injected into user prompt
   │
   └─ Claude claude-opus-4-7
-       system: [persona] + [arch summary]   ← both ephemeral-cached
-       user:   template + var slots + code snippet
+       system: [persona] + [schema] + [arch summary]   ← all ephemeral-cached
+       user:   template + var slots + context window sample + code snippet
        → JSON: summary / technical_context / root_cause / action_items
   │
   └─ HTML email → dev team inbox
@@ -290,11 +347,13 @@ Splunk REST API
 
 All settings via `~/.logagent/config.env` (created by `logagent init`).
 
+### Core (both modes)
+
 | Variable | Default | Description |
 |---|---|---|
 | `SPLUNK_HOST` | — | `https://host:8089` |
 | `SPLUNK_INDEX` | `main` | Index to search |
-| `LOOKBACK_MINS` | `60` | How far back to scan |
+| `LOOKBACK_MINS` | `60` | How far back to scan (polling mode) |
 | `MAX_LLM_CLUSTERS` | `20` | Top-N clusters sent to Claude |
 | `GITHUB_REPO` | — | `owner/repo` of the app producing the logs |
 | `GITHUB_BRANCH` | `main` | Branch to read |
@@ -303,9 +362,27 @@ All settings via `~/.logagent/config.env` (created by `logagent init`).
 | `DRAIN_SIM` | `0.5` | Cluster similarity threshold (0–1) |
 | `MERGE_SIM` | `0.8` | Second-pass merge threshold |
 | `LLM_BUDGET_CHARS` | `3500` | Hard cap on user-message chars per LLM call |
-| `POLL_INTERVAL_SECS` | `3600` | Daemon poll interval in seconds (default: 1 hour) |
 | `DEDUP_WINDOW_MINS` | `120` | Suppress repeat alerts for same cluster within N minutes |
 | `CODEBASE_REFRESH_HOUR` | `7` | Hour (0-23) in Eastern Time to re-index GitHub codebase daily |
+
+### Polling mode only
+
+| Variable | Default | Description |
+|---|---|---|
+| `POLL_INTERVAL_SECS` | `3600` | Daemon poll interval in seconds (default: 1 hour) |
+
+### Event-driven mode only
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBHOOK_HOST` | `0.0.0.0` | Bind address for the webhook HTTP server |
+| `WEBHOOK_PORT` | `8765` | Listen port |
+| `WEBHOOK_SECRET` | — | If set, validates the `Authorization` header on every request |
+| `POST_WINDOW_SECS` | `120` | Silence timeout before a window fires (debounce) |
+| `MAX_WINDOW_SECS` | `600` | Hard cap — noisy stream fires after this many seconds regardless |
+| `WORKER_THREADS` | `3` | Concurrent incident processors |
+| `SPLUNK_FETCH_RETRIES` | `3` | Retries on transient Splunk errors |
+| `SPLUNK_RETRY_BASE` | `2.0` | Exponential back-off base (seconds) |
 
 ---
 
@@ -323,11 +400,13 @@ All settings via `~/.logagent/config.env` (created by `logagent init`).
 
 | File | Purpose |
 |---|---|
-| `logagent_cli.py` | CLI entry point + setup wizard |
-| `splunk_rca_agent.py` | Core agent pipeline |
+| `splunk_rca_agent.py` | Core pipeline — `compress_events()`, `SplunkClient`, `DrainClusterer`, `RCAAnalyzer`, `EmailReporter`, `LogMonitorAgent` |
+| `event_driven_agent.py` | Event-driven agent — `IncidentBuffer`, `IncidentWindow`, `_WebhookServer`, `EventDrivenLogAgent` |
 | `codebase_context.py` | GitHub codebase indexer (also runs standalone) |
+| `logagent_cli.py` | CLI entry point + setup wizard |
 | `pyproject.toml` | PyPI packaging + ruff config |
 | `Dockerfile` | Docker alternative |
+| `tests/` | pytest suite — 199 tests, 85 % coverage |
 | `ARCHITECTURE.md` | Full system architecture, data flow diagrams, token cost breakdown |
 
 → For a deep-dive into how the pipeline works internally, see [ARCHITECTURE.md](ARCHITECTURE.md).

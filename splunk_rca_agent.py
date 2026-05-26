@@ -463,6 +463,9 @@ def _format_context_window(error_line: str, window: list[str], max_display: int 
       >>> ERROR DatabaseConnectionPool exhausted after 30000ms timeout
           WARN  Returning HTTP 503 to upstream caller  (×12)
     """
+    if not window:
+        return ""
+
     # ── Locate the error line in the window (first match by content) ─────────
     err_idx = next(
         (
@@ -508,6 +511,85 @@ def _format_context_window(error_line: str, window: list[str], max_display: int 
         suffix = f"  (×{count})" if count > 1 else ""
         lines_out.append(f"{prefix}{window[orig_idx][:cap]}{suffix}")
     return "\n".join(lines_out)
+
+
+# ── REUSABLE COMPRESSION PIPELINE ─────────────────────────────────────────────
+def compress_events(ctx_events: list[ContextualEvent]) -> tuple[list[LogCluster], CompressionStats]:
+    """
+    Run compression stages [1]–[5] + [6a] on a list of contextual events.
+
+    Shared by both LogMonitorAgent (polling) and EventDrivenLogAgent (webhook).
+    Accepts (error_line, context_window_lines) pairs from any source.
+
+    Stages:
+      [1] Pre-dedup          exact-hash, keep first context window per unique line
+      [2] Stack compressor   Java/Python frame collapse
+      [3] Drain clustering   prefix-tree similarity grouping with var slots
+      [4] Cluster merger     second-pass 0.8-similarity merge
+      [6a] Slot inlining     single-literal slots inlined into template (lossless)
+
+    Returns (clusters sorted by count DESC, CompressionStats).
+    cluster_id values are stable after this call — callers must not mutate
+    cluster.template afterward (cluster_id is md5 of template_str).
+    """
+    stats = CompressionStats()
+    if not ctx_events:
+        return [], stats
+
+    stats.raw = len(ctx_events)
+    stats.context_lines = sum(len(ctx) for _, ctx in ctx_events)
+
+    # [1] Pre-dedup — keep first context window seen per unique error line
+    seen: dict[str, list[str]] = {}
+    for error_line, ctx in ctx_events:
+        if error_line not in seen:
+            seen[error_line] = ctx
+    stats.unique = len(seen)
+    log.info(
+        "[1] dedup: %d → %d unique (%.1fx)",
+        stats.raw,
+        stats.unique,
+        stats.raw / max(stats.unique, 1),
+    )
+
+    # [2] Stack trace compression
+    compressed: dict[str, tuple[list[str], int]] = {}
+    for error_line, ctx in seen.items():
+        c = compress_stacktrace(error_line)
+        if c in compressed:
+            _, w = compressed[c]
+            compressed[c] = (ctx, w + 1)
+        else:
+            compressed[c] = (ctx, 1)
+    stats.compressed = len(compressed)
+    log.info("[2] stack-compress: %d → %d", stats.unique, stats.compressed)
+
+    # [3] Drain clustering
+    drain = DrainClusterer()
+    drain_input: list[tuple[str, list[str], int]] = [
+        (line, ctx, weight) for line, (ctx, weight) in compressed.items()
+    ]
+    clusters = drain.cluster(drain_input)
+    stats.clusters = len(clusters)
+    log.info("[3] drain: %d clusters", stats.clusters)
+
+    # [4] Post-drain merge
+    clusters = merge_clusters(clusters)
+    stats.merged = len(clusters)
+    log.info(
+        "[4] merge: %d → %d (%.1fx)",
+        stats.clusters,
+        stats.merged,
+        stats.clusters / max(stats.merged, 1),
+    )
+
+    if not clusters:
+        return [], stats
+
+    # [6a] Single-value slot inlining — MUST run before any cluster_id dedup lookups
+    inline_single_slots(clusters)
+
+    return sorted(clusters, key=lambda c: -c.count), stats
 
 
 # ── SPLUNK CLIENT ─────────────────────────────────────────────────────────────
@@ -647,6 +729,62 @@ class SplunkClient:
             ctx_lines = ctx_by_stream.get(key, stream["errors"])  # fallback to error-only
             for error_raw in stream["errors"]:
                 results.append((error_raw, ctx_lines))
+        return results
+
+    def fetch_context_for_stream(
+        self,
+        host: str,
+        source: str,
+        first_error_time: float,
+        pre_secs: int = PRE_WINDOW_SECS,
+        post_secs: int = POST_WINDOW_SECS,
+    ) -> list[ContextualEvent]:
+        """
+        Fetch the incident context window for a single known stream.
+
+        Used by EventDrivenLogAgent after an IncidentWindow fires. Unlike
+        fetch_anomalies() which runs a two-pass discovery, this method already
+        knows *where* (host + source) and *when* (first_error_time) the error
+        occurred — supplied by the Splunk webhook trigger — so it goes straight
+        to a single targeted SPL.
+
+        Window: [first_error_time - pre_secs, first_error_time + post_secs]
+        Returns [(error_line, all_context_lines)] for every error in the window.
+        Empty list if Splunk finds no results or no anomaly lines are present.
+        """
+        batch_earliest = int(first_error_time - pre_secs)
+        batch_latest = int(first_error_time + post_secs)
+
+        log.info(
+            "Context fetch for %s/%s  window=[%s → %s]",
+            host,
+            source,
+            datetime.fromtimestamp(batch_earliest, tz=timezone.utc).strftime("%H:%M:%S"),
+            datetime.fromtimestamp(batch_latest, tz=timezone.utc).strftime("%H:%M:%S"),
+        )
+
+        rows = self._run_spl(
+            f'search index="{SPLUNK_INDEX}" '
+            f"earliest={batch_earliest} latest={batch_latest} "
+            f'host="{self._esc(host)}" source="{self._esc(source)}" '
+            f"| sort _time "
+            f"| head {MAX_LOG_RESULTS} "
+            f"| fields _time _raw",
+        )
+        if not rows:
+            return []
+
+        all_lines = [r.get("_raw", "") for r in rows if r.get("_raw")]
+        results: list[ContextualEvent] = [
+            (line, all_lines) for line in all_lines if ANOMALY_RE.search(line)
+        ]
+        log.info(
+            "Context fetch: %d total lines, %d error lines for %s/%s",
+            len(all_lines),
+            len(results),
+            host,
+            source,
+        )
         return results
 
 
@@ -834,7 +972,9 @@ class RCAAnalyzer:
             )
         else:
             self._arch_block = None
-            log.warning("build_arch_summary() returned empty — falling back to generic RCA context.")
+            log.warning(
+                "build_arch_summary() returned empty — falling back to generic RCA context."
+            )
         return True
 
     def _system_blocks(self) -> list[dict]:
@@ -1086,9 +1226,6 @@ class LogMonitorAgent:
         if refreshed:
             log.info("✅  Codebase re-indexed — RCA context updated with today's code.")
 
-        drain = DrainClusterer()  # fresh clusterer per cycle — each window is independent
-        stats = CompressionStats()
-
         # ── Pass 1 + 2: error discovery → time-windowed context batch fetch ──
         log.info(
             "Polling — last %d min | index=%s | window: -%ds/+%ds around first error",
@@ -1099,73 +1236,25 @@ class LogMonitorAgent:
         )
         ctx_events: list[ContextualEvent] = self.splunk.fetch_anomalies()
         if not ctx_events:
-            log.info("✅  All quiet — no ERROR/EXCEPTION/FAILED/CRITICAL/FATAL in last %d min.", LOOKBACK_MINS)
+            log.info(
+                "✅  All quiet — no ERROR/EXCEPTION/FAILED/CRITICAL/FATAL in last %d min.",
+                LOOKBACK_MINS,
+            )
             return False
 
-        stats.raw = len(ctx_events)
-        stats.context_lines = sum(len(ctx) for _, ctx in ctx_events)
         log.info(
-            "⚠️  %d error event(s) across %d context lines — running compression pipeline",
-            stats.raw,
-            stats.context_lines,
+            "⚠️  %d error event(s) — running compression pipeline",
+            len(ctx_events),
         )
 
-        # ── [1] Pre-dedup on error_line; keep first context window per unique line ──
-        seen: dict[str, list[str]] = {}  # error_line → context_window
-        for error_line, ctx in ctx_events:
-            if error_line not in seen:
-                seen[error_line] = ctx
-        stats.unique = len(seen)
-        log.info(
-            "[1] dedup: %d → %d unique error lines (%.1fx)",
-            stats.raw,
-            stats.unique,
-            stats.raw / max(stats.unique, 1),
-        )
-
-        # ── [2] Stack trace compression; preserve context window ──────────────
-        compressed: dict[str, tuple[list[str], int]] = {}  # line → (ctx, weight)
-        for error_line, ctx in seen.items():
-            c = compress_stacktrace(error_line)
-            if c in compressed:
-                _, w = compressed[c]
-                compressed[c] = (ctx, w + 1)
-            else:
-                compressed[c] = (ctx, 1)
-        stats.compressed = len(compressed)
-        log.info("[2] stack-compress: %d → %d lines", stats.unique, stats.compressed)
-
-        # ── [3] Drain clustering (error_line, context_window, weight) ─────────
-        drain_input: list[tuple[str, list[str], int]] = [
-            (line, ctx, weight) for line, (ctx, weight) in compressed.items()
-        ]
-        clusters = drain.cluster(drain_input)
-        stats.clusters = len(clusters)
-        log.info("[3] drain: %d clusters", stats.clusters)
-
-        # ── [4] Post-drain merge ──────────────────────────────────────────────
-        clusters = merge_clusters(clusters)
-        stats.merged = len(clusters)
-        log.info(
-            "[4] merge: %d → %d clusters (%.1fx further)",
-            stats.clusters,
-            stats.merged,
-            stats.clusters / max(stats.merged, 1),
-        )
-
-        if not clusters:
-            log.info("Zero clusters after merge — nothing to report.")
+        # ── [1]–[4] + [6a]: shared compression pipeline ───────────────────────
+        all_clusters, stats = compress_events(ctx_events)
+        if not all_clusters:
+            log.info("Zero clusters after compression — nothing to report.")
             return False
-
-        # ── [6a] Single-value slot inlining (lossless prompt compression) ────
-        # Slots with one literal value get inlined back into the template,
-        # making the LLM prompt AND the email report's template line shorter
-        # and more readable.  Affects cluster_id (md5 of template_str) so it
-        # MUST run before any dedup lookup against self._reported.
-        inline_single_slots(clusters)
 
         # ── Top-N selection ───────────────────────────────────────────────────
-        top = sorted(clusters, key=lambda c: -c.count)[:MAX_LLM_CLUSTERS]
+        top = all_clusters[:MAX_LLM_CLUSTERS]
 
         # ── Cross-cycle dedup: skip patterns seen in the last DEDUP_WINDOW_MINS ──
         new_clusters, suppressed = self._split_new_known(top)
@@ -1226,7 +1315,10 @@ class LogMonitorAgent:
         _shutdown = threading.Event()
 
         def _handle_signal(sig: int, frame: object) -> None:
-            log.info("🛑  Shutdown signal received (sig=%d) — finishing current cycle then stopping.", sig)
+            log.info(
+                "🛑  Shutdown signal received (sig=%d) — finishing current cycle then stopping.",
+                sig,
+            )
             _shutdown.set()
 
         signal.signal(signal.SIGTERM, _handle_signal)
