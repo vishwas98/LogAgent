@@ -208,7 +208,9 @@ IncidentBuffer
     _windows dict protected by threading.Lock
     on_window_ready called without lock → no deadlock risk
 
-_WebhookServer  (http.server.HTTPServer on WEBHOOK_HOST:WEBHOOK_PORT)
+_WebhookServer  (socketserver.ThreadingMixIn + http.server.HTTPServer on WEBHOOK_HOST:WEBHOOK_PORT)
+  Each incoming POST is handled in its own thread (daemon_threads=True) so
+  concurrent Splunk saved-search alerts never queue behind each other.
   POST /webhook
     1. Validate Authorization header (WEBHOOK_SECRET, hmac.compare_digest)
     2. Parse JSON body → _parse_webhook_payload()
