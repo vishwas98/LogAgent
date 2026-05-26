@@ -6,13 +6,21 @@ Splunk anomaly monitor → enhanced Drain clustering → LLM RCA → HTML email
 Runs as a 24/7 daemon (LogMonitorAgent.start()) or single-shot (run_once()).
 Only fires the LLM + email when NEW error patterns appear — quiet cycles are silent.
 
-Compression pipeline (6 stages):
+Compression pipeline (6 stages + 3 prompt-level optimizations):
   [1] Pre-dedup         exact-hash lines → count weights (O(1)/line)
   [2] Stack compressor  collapse Java/Python frames → 2 kept + N omitted
   [3] Extended tokenize key=value, quoted strings, thread IDs → typed tokens
   [4] Drain clustering  prefix-tree similarity grouping with weight + var slots
   [5] Cluster merger    second-pass similarity merge of near-identical templates
   [6] Token budget      variable-slot differential encoding + hard char cap
+
+Prompt-level optimizations applied at LLM call time (lossless w.r.t. RCA accuracy):
+  [6a] Single-value slot inlining   inline_single_slots() — slots with exactly one
+       literal value are inlined into the template (drops the slot table row).
+  [6b] Context window dedup         _format_context_window() collapses consecutive
+       tokenized-equivalent lines into "first original + (×N)" notation.
+  [6c] Cached output schema         JSON schema lives in a cached system block,
+       not repeated in every per-cluster user prompt (~8 KB saved per run).
 
 Codebase-aware RCA (via codebase_context.py):
   - Reads GitHub main branch once at startup
@@ -380,21 +388,82 @@ def merge_clusters(clusters: list[LogCluster]) -> list[LogCluster]:
     return merged
 
 
-# ── CONTEXT WINDOW FORMATTER ──────────────────────────────────────────────────
+# ── [6a] SINGLE-VALUE SLOT INLINING ──────────────────────────────────────────
+def inline_single_slots(clusters: list[LogCluster]) -> None:
+    """
+    Mutate clusters in place: slots with exactly one literal observed value are
+    inlined back into the template (replacing the wildcard at that position) and
+    removed from the slot table.
+
+    Example before:
+      template:   ["connection", "to", "<*>", "failed"]
+      var_slots:  {2: ["db-primary"]}        ← only one value ever seen
+      → display:  "connection to <*> failed" + slot row for [2]
+
+    Example after:
+      template:   ["connection", "to", "db-primary", "failed"]
+      var_slots:  {}                          ← slot row eliminated
+      → display:  "connection to db-primary failed"
+
+    Typed placeholders (values starting with '<' like '<IP>' or '<NUM>') are
+    NOT inlined — they represent a CLASS of values, not a single literal, so
+    keeping them as wildcards in the template preserves the abstraction.
+
+    Lossless: the literal value is fully preserved (moved from slot to template).
+    Saves ~50 chars per affected cluster (slot-row header + value formatting).
+    Also makes the email report's template line more readable for the on-call.
+    """
+    for c in clusters:
+        new_template = list(c.template)
+        new_slots: dict[int, list[str]] = {}
+        for pos, vals in c.var_slots.items():
+            if (
+                len(vals) == 1
+                and not vals[0].startswith("<")  # keep typed placeholders abstract
+                and pos < len(new_template)
+            ):
+                new_template[pos] = vals[0]
+            else:
+                new_slots[pos] = vals
+        c.template = new_template
+        c.var_slots = new_slots
+
+
+# ── CONTEXT WINDOW FORMATTER ([6b] internal dedup) ────────────────────────────
+def _tokenize_for_match(s: str) -> str:
+    """Apply the same variable substitutions used for clustering, return the
+    normalized string (used ONLY for adjacent-line equality matching — display
+    still shows the original line so no information is lost)."""
+    for pat, tok in _VAR_SUBS:
+        s = pat.sub(tok, s)
+    return s.strip()
+
+
 def _format_context_window(error_line: str, window: list[str], max_display: int = 40) -> str:
     """
-    Format a context window for the LLM.
-    Marks the triggering error line with '>>>' and trims to max_display lines.
+    Format a context window for the LLM with [6b] internal dedup.
 
-    Example output:
-      [12 lines before | ERROR | 8 lines after]
-          INFO  DB pool at 95% capacity (19/20)
-          INFO  Queuing request — waiting for free connection
+    Pipeline:
+      1. Locate the triggering error line (marked with '>>>' in output)
+      2. Tokenize every line (for matching only) using _VAR_SUBS
+      3. Collapse runs of consecutive tokenized-equivalent lines, keeping the
+         FIRST original line as display + "(×N)" suffix when N>1
+      4. The error line is never absorbed into a neighbouring run
+      5. Trim symmetrically around the error to max_display collapsed runs
+
+    Lossless guarantee:
+      - First original of each run is shown verbatim → actual values preserved
+      - Cluster-level var_slots already capture cross-occurrence variance
+      - Error line shown unchanged (no tokenization, larger char cap)
+
+    Example output (raw 50-line window → 4 displayed lines):
+      [2 lines before | ERROR | 1 lines after]
+          INFO  DB pool at 95% capacity (19/20)  (×30)
+          INFO  Queuing request — waiting for free connection  (×3)
       >>> ERROR DatabaseConnectionPool exhausted after 30000ms timeout
-          WARN  Returning HTTP 503 to upstream caller
-          ERROR Retry 1/3 failed — pool still exhausted
+          WARN  Returning HTTP 503 to upstream caller  (×12)
     """
-    # Locate the error line in the window (first match by content)
+    # ── Locate the error line in the window (first match by content) ─────────
     err_idx = next(
         (
             i
@@ -403,17 +472,41 @@ def _format_context_window(error_line: str, window: list[str], max_display: int 
         ),
         len(window) // 2,  # fallback: assume middle
     )
-    # Trim symmetrically around the error
-    half = max_display // 2
-    start = max(0, err_idx - half)
-    end = min(len(window), err_idx + half + 1)
-    before_count = err_idx - start
-    after_count = end - err_idx - 1
 
+    # ── Build collapsed runs of adjacent tokenized-equivalent lines ──────────
+    # Each entry: (tokenized_key, first_original_idx, run_count, is_error_line)
+    # The error line is NEVER absorbed into a neighbouring run.
+    tokenized = [_tokenize_for_match(ln) for ln in window]
+    runs: list[tuple[str, int, int, bool]] = []
+    for i, tok in enumerate(tokenized):
+        is_err = i == err_idx
+        # Extend previous run iff: both non-error AND same tokenized form
+        if runs and not is_err and not runs[-1][3] and runs[-1][0] == tok:
+            prev_tok, prev_idx, prev_count, _ = runs[-1]
+            runs[-1] = (prev_tok, prev_idx, prev_count + 1, False)
+        else:
+            runs.append((tok, i, 1, is_err))
+
+    # ── Locate the error run in the collapsed sequence ───────────────────────
+    new_err_idx = next(j for j, r in enumerate(runs) if r[3])
+
+    # ── Trim symmetrically around the error ──────────────────────────────────
+    half = max_display // 2
+    start = max(0, new_err_idx - half)
+    end = min(len(runs), new_err_idx + half + 1)
+    before_count = new_err_idx - start
+    after_count = end - new_err_idx - 1
+
+    # ── Render ───────────────────────────────────────────────────────────────
     lines_out = [f"[{before_count} lines before | ERROR | {after_count} lines after]"]
-    for i, ln in enumerate(window[start:end], start=start):
-        prefix = ">>> " if i == err_idx else "    "
-        lines_out.append(prefix + ln[:200])
+    for j in range(start, end):
+        _, orig_idx, count, is_err = runs[j]
+        prefix = ">>> " if is_err else "    "
+        # Error line gets larger cap (200) to preserve full diagnostic detail;
+        # context lines capped at 150 (tokenized-equivalent siblings collapsed already).
+        cap = 200 if is_err else 150
+        suffix = f"  (×{count})" if count > 1 else ""
+        lines_out.append(f"{prefix}{window[orig_idx][:cap]}{suffix}")
     return "\n".join(lines_out)
 
 
@@ -565,34 +658,58 @@ _SYS_PERSONA = (
     "methods, or configs responsible for the error. Be concise and precise."
 )
 
-# [5] Differential encoding — variable slots replace raw samples
-# {code_section} is empty string when no indexer is configured
-_USER_TMPL = """\
-Analyze the log error cluster. Return ONLY valid JSON — no markdown, no fences.
+# [6c] Output schema lives in a CACHED system block — not repeated per-cluster.
+# Saves ~400 chars × N clusters of user-prompt tokens every run; cached after
+# first request so the schema itself costs effectively zero tokens thereafter.
+_SYS_OUTPUT_SCHEMA = """\
+For each log error cluster the user submits, respond with ONLY valid JSON \
+(no markdown, no code fences) matching this exact schema:
 
-Template : {template}
-Frequency: {count} occurrences
-{context}{code_section}
-
-Required JSON (exact keys):
-{{
+{
   "summary":           "<one sentence: what happened and its impact>",
   "technical_context": "<technical explanation of why this error occurs>",
   "root_cause":        "<the underlying trigger or failure point — cite file:line if code provided>",
   "action_items":      ["<actionable step 1>", "<step 2>", ...]
-}}"""
+}
+
+Ground every analysis in the application's architecture context (next system \
+block) and any source-code snippets included in the user message. Keep responses \
+concise — the consumer is an on-call engineer skimming an email at 2 AM."""
+
+# Compact per-cluster user message — schema description moved to cached system block.
+# {code_section} is empty string when no indexer is configured.
+_USER_TMPL = """\
+Template : {template}
+Frequency: {count} occurrences
+{context}{code_section}"""
+
+# Slot display cap: show up to N values per slot in the prompt; if more were
+# captured (up to MAX_SLOT_VALS) indicate the count with "+Nmore" suffix.
+# 3 examples is enough to convey variance; the count signals "this varies a lot"
+# without spending tokens on additional samples.
+_SLOT_DISPLAY_MAX = 3
 
 
 def _var_summary(cluster: LogCluster) -> str:
-    """Compact slot table: token position → sampled dynamic values."""
+    """
+    Compact slot table: token position → sampled dynamic values.
+
+    Format (one slot per line):  [pos]<token>='v1','v2','v3'+Nmore
+    - Compact single-line representation (no spaces around '=' or ',')
+    - Up to _SLOT_DISPLAY_MAX values shown; '+Nmore' indicates additional
+      unique values were captured beyond what's displayed.
+    """
     if not cluster.var_slots:
         return ""
-    rows = [
-        f"  [{pos}] {cluster.template[pos] if pos < len(cluster.template) else '<*>'}: "
-        + ", ".join(repr(v) for v in cluster.var_slots[pos])
-        for pos in sorted(cluster.var_slots)
-    ]
-    return "Variable slots (position → observed values):\n" + "\n".join(rows)
+    rows = []
+    for pos in sorted(cluster.var_slots):
+        vals = cluster.var_slots[pos]
+        token = cluster.template[pos] if pos < len(cluster.template) else "<*>"
+        shown = ",".join(repr(v) for v in vals[:_SLOT_DISPLAY_MAX])
+        extra = len(vals) - _SLOT_DISPLAY_MAX
+        more = f"+{extra}more" if extra > 0 else ""
+        rows.append(f"  [{pos}]{token}={shown}{more}")
+    return "Slots:\n" + "\n".join(rows)
 
 
 def _build_context(cluster: LogCluster) -> str:
@@ -722,16 +839,27 @@ class RCAAnalyzer:
 
     def _system_blocks(self) -> list[dict]:
         """
-        Two cached system blocks:
-          [0] persona — tiny, always present
-          [1] arch    — large, reused across all N cluster calls (ephemeral cache TTL=5min)
+        Three cached system blocks (all ephemeral-cached, TTL=5 min):
+          [0] persona — tiny, always present (SRE role definition)
+          [1] schema  — output JSON schema  ← [6c] moved here from user prompt
+                        saves ~400 chars per cluster call × N clusters per run
+          [2] arch    — large codebase architecture summary
+                        present only when GITHUB_TOKEN/REPO are configured
+
+        All three are reused across every per-cluster call this run, so cost is
+        paid once and amortized across all 20 cluster analyses.
         """
         blocks: list[dict] = [
             {
                 "type": "text",
                 "text": _SYS_PERSONA,
                 "cache_control": {"type": "ephemeral"},
-            }
+            },
+            {
+                "type": "text",
+                "text": _SYS_OUTPUT_SCHEMA,
+                "cache_control": {"type": "ephemeral"},
+            },
         ]
         if self._arch_block:
             blocks.append(self._arch_block)
@@ -1028,6 +1156,13 @@ class LogMonitorAgent:
         if not clusters:
             log.info("Zero clusters after merge — nothing to report.")
             return False
+
+        # ── [6a] Single-value slot inlining (lossless prompt compression) ────
+        # Slots with one literal value get inlined back into the template,
+        # making the LLM prompt AND the email report's template line shorter
+        # and more readable.  Affects cluster_id (md5 of template_str) so it
+        # MUST run before any dedup lookup against self._reported.
+        inline_single_slots(clusters)
 
         # ── Top-N selection ───────────────────────────────────────────────────
         top = sorted(clusters, key=lambda c: -c.count)[:MAX_LLM_CLUSTERS]

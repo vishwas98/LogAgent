@@ -94,9 +94,28 @@ raw_lines: list[str]  (up to 5,000 from Splunk)
      │      Merge var slots from both clusters
      │      Effect: catches near-identical templates split by prefix-key differences
      │
-     │  [6] TOKEN BUDGET
+     │  [6] TOKEN BUDGET + 3 prompt-level optimizations
      │      Select top-N clusters by count  (MAX_LLM_CLUSTERS=20)
      │      LLM user prompt capped at LLM_BUDGET_CHARS=3500 chars
+     │
+     │      [6a] Single-value slot inlining
+     │           Slots with 1 literal value → inlined into template (drops slot row)
+     │           "ERROR connecting to <*> port <*>" + slots[2]='db-primary',[4]='5432'
+     │             → "ERROR connecting to db-primary port 5432"   (slot table empty)
+     │           Typed placeholders (<IP>, <NUM>) NOT inlined — kept abstract.
+     │           Affects cluster_id; runs BEFORE cross-cycle dedup lookup.
+     │
+     │      [6b] Context window adjacent-line dedup
+     │           Tokenize each context line; collapse consecutive equivalents into
+     │           "first original + (×N)" notation. Error line is a hard boundary
+     │           (never absorbed into a run). Typical 60–80% char savings on noisy logs:
+     │             50 lines of  "INFO Heartbeat tick" → 1 display line "(×50)"
+     │           Lossless: first original is verbatim; var_slots already capture variance.
+     │
+     │      [6c] Output schema in cached system block
+     │           JSON schema description moved from per-cluster user prompt to a
+     │           cached system block. ~400 chars × N clusters saved per run.
+     │           Schema costs effectively zero tokens after first cluster (cache hit).
      │
      ▼
 clusters: list[LogCluster]
@@ -217,15 +236,19 @@ Per-cluster call:
   → JSON: summary / technical_context / root_cause (file:line) / action_items
 ```
 
-**Token cost per run** (with caching):
+**Token cost per run** (with caching + prompt-level optimizations):
 
 | Block | Tokens | Cached? |
 |---|---|---|
 | Persona (system) | ~40 | ✅ after first cluster |
+| Schema (system) | ~120 | ✅ after first cluster  ← moved from user prompt [6c] |
 | Arch summary (system) | ~1,500 | ✅ after first cluster |
-| User prompt per cluster | ~400–800 | ❌ unique per cluster |
+| User prompt per cluster | ~200–400 | ❌ unique per cluster |
 | Max output per cluster | ~200 | — |
-| **20 clusters total** | **~1,580 cached + 20×700 unique** | |
+| **20 clusters total** | **~1,660 cached + 20×300 unique** | ~7.6k input tokens/run |
+
+Pre-optimization (no [6a]/[6b]/[6c]): ~1,540 cached + 20×700 unique = ~15.5k input tokens/run.
+After [6a]/[6b]/[6c]: roughly **2× cheaper** with zero RCA-accuracy compromise.
 
 ---
 
