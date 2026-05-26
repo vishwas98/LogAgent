@@ -273,7 +273,9 @@ class CodebaseIndexer:
         self._tree = None
         self._files.clear()
         self._indexed_sha = None  # will be re-captured in next build_arch_summary()
-        log.debug("CodebaseIndexer: all caches cleared — full re-index on next build_arch_summary().")
+        log.debug(
+            "CodebaseIndexer: all caches cleared — full re-index on next build_arch_summary()."
+        )
 
     def build_arch_summary(self) -> str:
         """
@@ -296,7 +298,9 @@ class CodebaseIndexer:
             sha = self.get_head_sha()
             if sha:
                 self._indexed_sha = sha
-                log.info("Indexing %s/%s@%s  commit %s", self.owner, self.repo, self.branch, sha[:8])
+                log.info(
+                    "Indexing %s/%s@%s  commit %s", self.owner, self.repo, self.branch, sha[:8]
+                )
 
         all_paths = self._all_paths()
         path_set = set(all_paths)
